@@ -1356,6 +1356,25 @@ router.get("/m3u8", async (req: Request, res: Response) => {
     // A variant has #EXTINF segment entries directly; a master has #EXT-X-STREAM-INF.
     const isVariantPlaylist = /^#EXTINF:/m.test(text) && !/^#EXT-X-STREAM-INF/m.test(text);
 
+    // AnimeSalt CDN variant playlists don't include #EXT-X-PLAYLIST-TYPE:VOD or
+    // #EXT-X-ENDLIST even though the full episode's segments are present.  Inject
+    // both tags directly into `text` before the rewriting loop — plain "#" tag
+    // lines pass through the rewriter unchanged, so they survive into the output.
+    // We do this early (before the audio-probe block) so they are also present in
+    // any synthetic master that is assembled from this text.
+    // The CDN already appends #EXT-X-ENDLIST, but never adds
+    // #EXT-X-PLAYLIST-TYPE:VOD.  Inject it here, right after the first line
+    // (#EXTM3U), so the tag survives the rewriting loop intact (# lines are
+    // returned unchanged by the rewriter).
+    let playlistText = text;
+    if (isAnimeSaltCdn && isVariantPlaylist && !playlistText.includes("#EXT-X-PLAYLIST-TYPE")) {
+      playlistText = playlistText.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+      const nl = playlistText.indexOf("\n");
+      if (nl !== -1) {
+        playlistText = playlistText.slice(0, nl + 1) + "#EXT-X-PLAYLIST-TYPE:VOD\n" + playlistText.slice(nl + 1);
+      }
+    }
+
     // For AnimeSalt CDN variant playlists, probe the first TS segment for muxed
     // audio PIDs and synthesise a proper HLS master with #EXT-X-MEDIA:TYPE=AUDIO
     // so LG TV's native player shows a language selector.
@@ -1363,7 +1382,7 @@ router.get("/m3u8", async (req: Request, res: Response) => {
     // request audio filtering (doAudioFilter means we're already serving filtered
     // segments — no need for another synthetic master layer).
     if (isVariantPlaylist && /as-cdn\d*\.top/i.test(parsed.hostname) && !doAudioFilter) {
-      const firstSegRel = text.split("\n").find(l => { const t = l.trim(); return t && !t.startsWith("#"); });
+      const firstSegRel = playlistText.split("\n").find(l => { const t = l.trim(); return t && !t.startsWith("#"); });
       if (firstSegRel) {
         const firstSegUrl = firstSegRel.trim().startsWith("http") ? firstSegRel.trim()
           : firstSegRel.trim().startsWith("/") ? parsed.origin + firstSegRel.trim()
@@ -1435,7 +1454,7 @@ router.get("/m3u8", async (req: Request, res: Response) => {
     }
 
     let nextLineIsVariant = false;
-    const rewritten = text.split("\n").map((line) => {
+    const rewritten = playlistText.split("\n").map((line) => {
       const trimmed = line.trim();
 
       if (trimmed.startsWith("#EXT-X-MEDIA") && trimmed.includes('URI="')) {
@@ -1494,10 +1513,12 @@ router.get("/m3u8", async (req: Request, res: Response) => {
       ? filterToSingleVariantProxy(rewritten)
       : rewritten;
 
+    const outputM3u8 = finalM3u8;
+
     res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Cache-Control", "no-store");
-    res.send(finalM3u8);
+    res.send(outputM3u8);
   } catch (err) {
     logger.error({ err, targetUrl }, "M3U8 proxy error");
     if (!res.headersSent) res.status(502).end();
