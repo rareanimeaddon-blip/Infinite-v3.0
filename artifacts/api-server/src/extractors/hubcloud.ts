@@ -16,6 +16,18 @@ export async function extractHubCloud(
   try {
     const uri = new URL(url);
     const baseUrl = `${uri.protocol}//${uri.host}`;
+    // HubCloud base URL used as Referer/Origin for the hosted file buckets.
+    // Backblaze B2 / FSL / S3 buckets enforce hotlink protection and return
+    // 403 when no Referer is present.  Attaching the HubCloud origin as the
+    // Referer satisfies that check.  These headers are picked up by
+    // hd4uStreamToStremio / fourkdStreamToStremio and used to proxy the file
+    // through the addon server so the headers are always sent correctly.
+    const hubReferer = `${baseUrl}/`;
+    const hubOrigin = baseUrl;
+    const bucketHeaders: Record<string, string> = {
+      Referer: hubReferer,
+      Origin: hubOrigin,
+    };
 
     let href: string;
     if (url.includes("hubcloud.php")) {
@@ -65,6 +77,7 @@ export async function extractHubCloud(
           title: `FSL Server ${labelExtras}`,
           url: link,
           type: "mp4",
+          headers: bucketHeaders,
           behaviorHints: { notWebReady: false },
         });
       } else if (text.includes("download file")) {
@@ -73,6 +86,7 @@ export async function extractHubCloud(
           title: `Direct Download ${labelExtras}`,
           url: link,
           type: "mp4",
+          headers: bucketHeaders,
           behaviorHints: { notWebReady: false },
         });
       } else if (text.includes("fslv2")) {
@@ -81,6 +95,7 @@ export async function extractHubCloud(
           title: `FSLv2 ${labelExtras}`,
           url: link,
           type: "mp4",
+          headers: bucketHeaders,
           behaviorHints: { notWebReady: false },
         });
       } else if (text.includes("s3 server")) {
@@ -89,6 +104,7 @@ export async function extractHubCloud(
           title: `S3 ${labelExtras}`,
           url: link,
           type: "mp4",
+          headers: bucketHeaders,
           behaviorHints: { notWebReady: false },
         });
       } else if (text.includes("mega server")) {
@@ -97,6 +113,7 @@ export async function extractHubCloud(
           title: `Mega ${labelExtras}`,
           url: link,
           type: "mp4",
+          headers: bucketHeaders,
           behaviorHints: { notWebReady: false },
         });
       } else if (

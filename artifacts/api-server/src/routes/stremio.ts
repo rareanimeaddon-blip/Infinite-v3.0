@@ -572,6 +572,23 @@ function hd4uStreamToStremio(s: Stream, req?: Request): Record<string, unknown> 
       behaviorHints: { notWebReady: true },
     };
   }
+  // For MP4 streams that carry a Referer header (e.g. Backblaze B2 / FSL /
+  // S3 buckets from HubCloud), route through the addon proxy so the correct
+  // Referer is sent server-side — players/Stremio do not forward proxyHeaders
+  // reliably, so direct URLs with bucket hotlink-protection return 403.
+  const referer = s.headers?.["Referer"] || s.headers?.["referer"] || "";
+  if (referer && req) {
+    const base = apiBase(req);
+    let origin = referer;
+    try { origin = new URL(referer).origin; } catch {}
+    const proxiedUrl = `${base}/proxy?u=${encodeParam(s.url)}&ref=${encodeParam(referer)}&ori=${encodeParam(origin)}`;
+    return {
+      name: s.name,
+      title: s.title,
+      url: proxiedUrl,
+      behaviorHints: { notWebReady: false },
+    };
+  }
   return {
     name: s.name,
     title: s.title,
@@ -581,6 +598,28 @@ function hd4uStreamToStremio(s: Stream, req?: Request): Record<string, unknown> 
       ...(s.headers ? { proxyHeaders: { request: s.headers } } : {}),
       ...s.behaviorHints,
     },
+  };
+}
+
+function fourkdStreamToStremio(s: import("../providers/fourkdhub.js").FourkdStream, req?: Request): Record<string, unknown> {
+  const referer = s.headers?.["Referer"] || s.headers?.["referer"] || "";
+  if (referer && req) {
+    const base = apiBase(req);
+    let origin = referer;
+    try { origin = new URL(referer).origin; } catch {}
+    const proxiedUrl = `${base}/proxy?u=${encodeParam(s.url)}&ref=${encodeParam(referer)}&ori=${encodeParam(origin)}`;
+    return {
+      name: s.name,
+      title: s.title,
+      url: proxiedUrl,
+      behaviorHints: { ...s.behaviorHints, notWebReady: false },
+    };
+  }
+  return {
+    name: s.name,
+    title: s.title,
+    url: s.url,
+    behaviorHints: s.behaviorHints,
   };
 }
 
@@ -1896,7 +1935,7 @@ router.get("/stream/:type/:id.json", async (req, res) => {
       const ctStreams = ctResult.status === "fulfilled" ? ctResult.value : [];
       const dmStreams = dmResult.status === "fulfilled" ? dmResult.value : [];
       const sfStreams = sfResult.status === "fulfilled" ? sfResult.value : [];
-      const fkStreams = fkResult.status === "fulfilled" ? fkResult.value : [];
+      const fkStreams = (fkResult.status === "fulfilled" ? fkResult.value : []).map((s) => fourkdStreamToStremio(s, req));
       const dfStreams = (dfResult.status === "fulfilled" ? dfResult.value : []) as DooflixStream[];
 
       if (asResult.status === "rejected") logger.error({ err: asResult.reason, imdbId }, "AnimeSalt: crashed");
@@ -1976,7 +2015,7 @@ router.get("/stream/:type/:id.json", async (req, res) => {
       const ctStreams = ctResult.status === "fulfilled" ? ctResult.value : [];
       const dmStreams = dmResult.status === "fulfilled" ? dmResult.value : [];
       const sfStreams = sfResult.status === "fulfilled" ? sfResult.value : [];
-      const fkStreams = fkResult.status === "fulfilled" ? fkResult.value : [];
+      const fkStreams = (fkResult.status === "fulfilled" ? fkResult.value : []).map((s) => fourkdStreamToStremio(s, req));
       const dfStreams = (dfResult.status === "fulfilled" ? dfResult.value : []) as DooflixStream[];
 
       if (asResult.status === "rejected") logger.error({ err: asResult.reason, tmdbId: numericTmdbId }, "AnimeSalt: crashed");

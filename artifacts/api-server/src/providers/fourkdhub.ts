@@ -274,6 +274,7 @@ export interface FourkdStream {
   name: string;
   title: string;
   url: string;
+  headers?: Record<string, string>;
   behaviorHints: { bingeGroup: string; notWebReady: boolean };
 }
 
@@ -325,6 +326,7 @@ export async function getFourkdHubStreams(
               name: `${nameBadge}\n${s.name}`,
               title: titleLines,
               url: s.url,
+              headers: s.headers,
               behaviorHints: { bingeGroup: `4khdhub-hc`, notWebReady: false },
             });
           }

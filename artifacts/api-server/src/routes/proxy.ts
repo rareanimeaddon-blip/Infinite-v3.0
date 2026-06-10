@@ -26,6 +26,7 @@ async function pipeUpstream(
   cookie: string | undefined,
   req: Request,
   res: Response,
+  extraHeaders?: Record<string, string>,
 ): Promise<void> {
   const t0 = Date.now();
 
@@ -34,6 +35,11 @@ async function pipeUpstream(
     referer: "https://api3.aoneroom.com",
     origin: "https://api3.aoneroom.com",
   };
+  if (extraHeaders) {
+    for (const [k, v] of Object.entries(extraHeaders)) {
+      upstreamHeaders[k.toLowerCase()] = v;
+    }
+  }
   if (cookie) upstreamHeaders["cookie"] = cookie;
 
   const range = req.headers["range"];
@@ -707,7 +713,7 @@ router.options("/hmproxy", (_req, res) => {
 });
 
 router.get("/proxy", async (req, res) => {
-  const { u, c } = req.query as Record<string, string | undefined>;
+  const { u, c, ref, ori } = req.query as Record<string, string | undefined>;
 
   if (!u) { res.status(400).json({ error: "Missing u param" }); return; }
 
@@ -721,11 +727,18 @@ router.get("/proxy", async (req, res) => {
   }
 
   const cookie = c ? decodeParam(c) : undefined;
+
+  // Optional referer/origin override — used to satisfy hotlink protection on
+  // Backblaze B2 / FSL / S3 buckets served via HubCloud.
+  const extraHeaders: Record<string, string> | undefined = (ref || ori) ? {} : undefined;
+  if (extraHeaders && ref) extraHeaders["referer"] = decodeParam(ref);
+  if (extraHeaders && ori) extraHeaders["origin"] = decodeParam(ori);
+
   const isMpd = targetUrl.includes(".mpd") || targetUrl.includes("manifest");
 
   if (!isMpd) {
     try {
-      await pipeUpstream(targetUrl, cookie, req, res);
+      await pipeUpstream(targetUrl, cookie, req, res, extraHeaders);
     } catch (err) {
       logger.error({ err, targetUrl }, "Proxy error");
       if (!res.headersSent) res.status(502).end();
