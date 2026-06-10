@@ -1,0 +1,1 @@
+- [RareAnime LG TV ABR fix](rareanime-lg-tv-abr.md) — LG WebOS "Error while decoding" after ~5s is caused by MPEG-TS ABR switching; fix is filterToSingleVariant() in rareanime-proxy.ts.

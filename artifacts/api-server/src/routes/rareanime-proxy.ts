@@ -89,6 +89,122 @@ function rewriteM3u8(
   }).join("\n");
 }
 
+/**
+ * If `content` is a master HLS playlist (contains #EXT-X-STREAM-INF),
+ * rewrite it to expose ONLY the single highest-bandwidth variant.
+ *
+ * LG WebOS's native HLS player buffers ~5–6 s of MPEG-TS and then attempts
+ * its first ABR quality switch.  That switch causes a PID/codec discontinuity
+ * in the MPEG-TS stream that WebOS cannot recover from → "Error while
+ * decoding".  Android ExoPlayer re-initialises the codec on every switch and
+ * is unaffected.
+ *
+ * By exposing a single variant the player never attempts a switch, and
+ * playback continues indefinitely on both platforms.
+ *
+ * This function is called on the already-rewritten playlist (all URLs are
+ * already proxied absolute URLs), so no URL resolution is needed here.
+ *
+ * MPEG-TS muxes audio into the video stream — EXT-X-MEDIA audio groups are
+ * therefore not needed and are stripped to keep the playlist clean.
+ */
+function filterToSingleVariant(content: string): string {
+  if (!content.includes("#EXT-X-STREAM-INF")) {
+    // Not a master playlist — media playlist, pass through unchanged.
+    return content;
+  }
+
+  const lines = content.split("\n");
+
+  // ── Pass 1: collect all variant entries (STREAM-INF line + URL line) ────────
+  interface Variant {
+    infIdx: number;   // index of the #EXT-X-STREAM-INF line
+    urlIdx: number;   // index of the following URL line
+    bandwidth: number;
+  }
+  const variants: Variant[] = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const t = lines[i]?.trim() ?? "";
+    if (!t.startsWith("#EXT-X-STREAM-INF")) continue;
+
+    const bwM = t.match(/BANDWIDTH=(\d+)/i);
+    const bandwidth = bwM ? parseInt(bwM[1]!, 10) : 0;
+
+    // The URL is the next non-empty, non-comment line
+    let j = i + 1;
+    while (j < lines.length && (lines[j]?.trim() === "" || lines[j]?.trim().startsWith("#"))) {
+      j++;
+    }
+
+    if (j < lines.length && lines[j]?.trim() !== "") {
+      variants.push({ infIdx: i, urlIdx: j, bandwidth });
+      i = j; // skip past the URL line so we don't double-count
+    }
+  }
+
+  if (variants.length <= 1) {
+    // Already single-variant or empty — nothing to filter.
+    return content;
+  }
+
+  // ── Pick the single highest-bandwidth variant ────────────────────────────────
+  const best = variants.reduce((a, b) => (b.bandwidth > a.bandwidth ? b : a));
+
+  logger.info(
+    {
+      totalVariants: variants.length,
+      selectedBandwidth: best.bandwidth,
+      droppedVariants: variants.length - 1,
+    },
+    "[RareAnimeProxy] filterToSingleVariant: reduced ABR master to single variant for LG WebOS compatibility"
+  );
+
+  // ── Build the set of line indices that belong to non-best variants ───────────
+  const dropIndices = new Set<number>();
+  for (const v of variants) {
+    if (v === best) continue;
+    dropIndices.add(v.infIdx);
+    dropIndices.add(v.urlIdx);
+  }
+
+  // ── Determine which AUDIO group the best variant references (if any) ─────────
+  const bestInfLine = lines[best.infIdx]?.trim() ?? "";
+  const audioGroupM = bestInfLine.match(/AUDIO="([^"]+)"/i);
+  const keepAudioGroup = audioGroupM?.[1] ?? null;
+
+  // ── Pass 2: build output ─────────────────────────────────────────────────────
+  const output: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (dropIndices.has(i)) continue;
+
+    const t = lines[i]?.trim() ?? "";
+
+    // Drop EXT-X-MEDIA audio/subtitle groups that are NOT referenced by the
+    // best variant (MPEG-TS embeds audio in-stream; separate groups unneeded).
+    if (t.startsWith("#EXT-X-MEDIA:")) {
+      const groupM = t.match(/GROUP-ID="([^"]+)"/i);
+      const group = groupM?.[1] ?? null;
+      if (group && group !== keepAudioGroup) continue;
+    }
+
+    // Drop EXT-X-I-FRAME-STREAM-INF trick-play variants — WebOS ignores them
+    // and they can confuse stricter parsers.
+    if (t.startsWith("#EXT-X-I-FRAME-STREAM-INF")) continue;
+
+    // On the best variant's STREAM-INF line, strip the AUDIO group reference
+    // if the group itself was also stripped (no separate audio track in TS).
+    if (i === best.infIdx && !keepAudioGroup) {
+      output.push((lines[i] ?? "").replace(/,?\s*AUDIO="[^"]*"/gi, ""));
+      continue;
+    }
+
+    output.push(lines[i] ?? "");
+  }
+
+  return output.join("\n");
+}
+
 /** Derive the addon's externally-accessible base URL from the request */
 function addonBaseUrl(req: Request): string {
   const publicUrl = process.env["PUBLIC_URL"];
@@ -130,9 +246,10 @@ raProxyRouter.options("/hls/{*splat}", (_req: Request, res: Response) => {
  * GET /api/hls/master.m3u8?url=...&ref=...&ck=...
  *
  * Fetches a master or media m3u8 from the upstream CDN with full auth
- * headers (Referer, Origin, Cookie), then rewrites every URL inside to
- * go through our proxy — including the cookie token so segment requests
- * are also authenticated.
+ * headers (Referer, Origin, Cookie), rewrites every URL to go through our
+ * proxy, then reduces any multi-variant ABR master to a single variant so
+ * that LG WebOS does not attempt quality switches (which cause MPEG-TS
+ * PID discontinuities and "Error while decoding" after ~5 s).
  */
 raProxyRouter.get("/hls/master.m3u8", async (req: Request, res: Response) => {
   const rawUrl = req.query["url"] as string | undefined;
@@ -171,17 +288,24 @@ raProxyRouter.get("/hls/master.m3u8", async (req: Request, res: Response) => {
     }
 
     const addonBase = addonBaseUrl(req);
+
+    // Step 1: rewrite all CDN URLs to go through our proxy
     const rewritten = rewriteM3u8(upstream.data, targetUrl, addonBase, referer, ckEncoded);
 
+    // Step 2: if this is a multi-variant ABR master, reduce to a single
+    // highest-bandwidth variant.  This prevents LG WebOS from attempting
+    // quality switches that cause MPEG-TS decoder errors.
+    const filtered = filterToSingleVariant(rewritten);
+
     logger.info(
-      { url: targetUrl.slice(0, 80), lines: rewritten.split("\n").length },
+      { url: targetUrl.slice(0, 80), lines: filtered.split("\n").length },
       "[RareAnimeProxy] m3u8 rewritten OK"
     );
 
     res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Cache-Control", "no-cache, no-store");
-    res.send(rewritten);
+    res.send(filtered);
   } catch (err) {
     logger.error(
       { err: (err as Error).message, url: targetUrl.slice(0, 100) },
@@ -197,8 +321,8 @@ raProxyRouter.get("/hls/master.m3u8", async (req: Request, res: Response) => {
  * GET /api/hls/seg?url=...&ref=...&ck=...
  *
  * Proxies a single HLS resource (TS segment, AES-128 key, or sub-playlist)
- * from the upstream CDN with full auth headers. If the response is itself
- * an m3u8, it is rewritten recursively.
+ * from the upstream CDN with full auth headers.  If the response is itself
+ * an m3u8 it is rewritten recursively and single-variant filtered.
  */
 raProxyRouter.get("/hls/seg", async (req: Request, res: Response) => {
   const rawUrl = req.query["url"] as string | undefined;
@@ -248,15 +372,16 @@ raProxyRouter.get("/hls/seg", async (req: Request, res: Response) => {
       isPlaylist;
 
     if (isM3u8Response) {
-      // Sub-playlist — rewrite URLs recursively
+      // Sub-playlist — rewrite URLs recursively and apply single-variant filter
       const text = typeof upstream.data === "string"
         ? upstream.data
         : String(upstream.data);
       const addonBase = addonBaseUrl(req);
       const rewritten = rewriteM3u8(text, targetUrl, addonBase, referer, ckEncoded);
+      const filtered = filterToSingleVariant(rewritten);
       res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
       res.setHeader("Cache-Control", "no-cache, no-store");
-      res.send(rewritten);
+      res.send(filtered);
     } else {
       // Binary segment — stream through directly
       if (upstream.headers["content-length"]) {
@@ -265,6 +390,8 @@ raProxyRouter.get("/hls/seg", async (req: Request, res: Response) => {
       if (upstream.headers["content-range"]) {
         res.setHeader("Content-Range", upstream.headers["content-range"] as string);
       }
+      // Accept-Ranges: bytes lets players seek within a segment if needed.
+      res.setHeader("Accept-Ranges", "bytes");
       res.setHeader("Content-Type", contentType || "video/mp2t");
       res.setHeader("Cache-Control", "public, max-age=3600");
       (upstream.data as NodeJS.ReadableStream).pipe(res);
