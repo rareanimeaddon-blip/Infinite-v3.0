@@ -1,0 +1,25 @@
+services:
+  infinite-streams:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: infinite-streams
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      PORT: "8080"
+      BASE_PATH: ""
+      NODE_ENV: production
+      # Optional — a hardcoded default is already baked in, but you can override:
+      # TMDB_API_KEY: "your_tmdb_api_key_here"
+      #
+      # Set this to your VPS domain so links in the addon (logo, configure URL,
+      # proxy URLs) always point to the right place:
+      # PUBLIC_URL: "https://yourdomain.com"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:8080/healthz').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s

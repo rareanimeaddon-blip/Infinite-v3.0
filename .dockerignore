@@ -1,0 +1,24 @@
+# Node modules — reinstalled fresh inside Docker
+node_modules
+**/node_modules
+
+# Build artifacts (rebuilt inside Docker)
+**/dist
+**/.tsbuildinfo
+**/*.tsbuildinfo
+
+# Dev & editor files
+.git
+.gitignore
+.env
+.env.*
+*.log
+
+# Replit-specific
+.replit
+.replit-artifact
+.local
+attached_assets
+
+# Mockup sandbox — not needed for the addon server
+artifacts/mockup-sandbox
