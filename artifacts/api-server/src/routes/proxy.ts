@@ -1204,6 +1204,61 @@ const AS_BROWSER_EXTRA: Record<string, string> = {
   "Connection": "keep-alive",
 };
 
+/**
+ * Reduce a proxied HLS master playlist to its single highest-bandwidth variant,
+ * preserving all #EXT-X-MEDIA (audio/subtitle) renditions.
+ *
+ * LG TV WebOS performs ABR quality-switching between variants; each switch
+ * triggers a video-decoder re-init that the WebOS player cannot recover from,
+ * causing "video freeze, audio continues".  By keeping only one variant we
+ * eliminate quality switching entirely.  Android ExoPlayer handles ABR fine
+ * so it is unaffected (it also only gets a single variant from this function).
+ */
+function filterToSingleVariantProxy(m3u8: string): string {
+  const lines = m3u8.split("\n");
+
+  // Collect all #EXT-X-MEDIA lines (audio renditions, subtitles, etc.)
+  const mediaLines: string[] = [];
+  // Collect #EXT-X-STREAM-INF + following variant URL pairs
+  interface VariantEntry { inf: string; url: string; bandwidth: number }
+  const variants: VariantEntry[] = [];
+
+  let pendingInf: string | null = null;
+  for (const line of lines) {
+    const t = line.trim();
+    if (t.startsWith("#EXT-X-MEDIA")) {
+      mediaLines.push(line);
+    } else if (t.startsWith("#EXT-X-STREAM-INF")) {
+      pendingInf = line;
+    } else if (pendingInf !== null) {
+      if (t && !t.startsWith("#")) {
+        const bwMatch = /BANDWIDTH=(\d+)/i.exec(pendingInf);
+        variants.push({ inf: pendingInf, url: line, bandwidth: bwMatch ? parseInt(bwMatch[1]!, 10) : 0 });
+      }
+      pendingInf = null;
+    }
+  }
+
+  if (variants.length === 0) return m3u8; // nothing to filter
+
+  // Pick highest-bandwidth variant
+  const best = variants.reduce((a, b) => b.bandwidth > a.bandwidth ? b : a);
+
+  const header = lines.filter(l => {
+    const t = l.trim();
+    return t.startsWith("#EXTM3U") || t.startsWith("#EXT-X-VERSION") || t.startsWith("#EXT-X-INDEPENDENT");
+  });
+
+  return [
+    ...header,
+    "",
+    ...mediaLines,
+    "",
+    best.inf,
+    best.url,
+  ].join("\n");
+}
+
 // /api/m3u8?url=<enc>&referer=<enc>&origin=<enc>
 // referer and origin are optional — defaults keep AnimeSalt backward-compat.
 router.get("/m3u8", async (req: Request, res: Response) => {
@@ -1421,10 +1476,20 @@ router.get("/m3u8", async (req: Request, res: Response) => {
       return proxyUrl(absUrl, isPlaylist);
     }).join("\n");
 
+    // If the CDN returned a master playlist (multiple quality variants), reduce
+    // it to a single highest-bandwidth variant before handing it to the player.
+    // LG TV WebOS's native HLS player performs ABR quality switches between
+    // variants; each switch triggers a video-decoder re-initialisation that
+    // WebOS cannot recover from ("video freeze, audio continues").
+    // Android ExoPlayer handles ABR correctly so it is unaffected.
+    const finalM3u8 = rewritten.includes("#EXT-X-STREAM-INF")
+      ? filterToSingleVariantProxy(rewritten)
+      : rewritten;
+
     res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Cache-Control", "no-store");
-    res.send(rewritten);
+    res.send(finalM3u8);
   } catch (err) {
     logger.error({ err, targetUrl }, "M3U8 proxy error");
     if (!res.headersSent) res.status(502).end();

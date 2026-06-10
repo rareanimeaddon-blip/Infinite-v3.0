@@ -170,12 +170,119 @@ export function probeAudioTracks(buf: Buffer, maxPackets = 40): ProbeResult {
   return { tracks: [], pmtPid };
 }
 
+// ─── CRC-32 (MPEG-TS polynomial 0x04C11DB7) ──────────────────────────────────
+
+/**
+ * Compute the MPEG-TS CRC-32 over buf[start .. start+len).
+ * Polynomial 0x04C11DB7, initial 0xFFFFFFFF, no input/output reflection.
+ * This is the standard CRC used in PAT/PMT/CAT section tables (ISO 13818-1).
+ */
+function crc32mpeg(buf: Buffer, start: number, len: number): number {
+  let crc = 0xFFFFFFFF;
+  for (let i = start; i < start + len; i++) {
+    const byte = buf[i]!;
+    for (let j = 7; j >= 0; j--) {
+      const bit = (byte >> j) & 1;
+      const msb = (crc >>> 31) & 1;
+      crc = ((crc << 1) >>> 0);
+      if (msb !== bit) crc = (crc ^ 0x04C11DB7) >>> 0;
+    }
+  }
+  return crc >>> 0;
+}
+
+// ─── PMT packet rewriter ──────────────────────────────────────────────────────
+
+/**
+ * Return a copy of a 188-byte PMT TS packet with stream-loop entries for all
+ * audio PIDs except `keepAudioPid` removed.
+ *
+ * Why this matters for LG WebOS:
+ *   filterVideoAndAudio drops the TS *packets* for dropped audio PIDs, but the
+ *   PMT table still *declares* those PIDs.  LG TV's native HLS player is strict:
+ *   it continuously polls for declared elementary streams and when it cannot find
+ *   the Telugu/Tamil audio packets it expects, it flags the segment as malformed,
+ *   which stalls the video decoder (video freezes) while the audio buffer plays
+ *   out.  Android ExoPlayer is lenient and ignores missing PIDs.
+ *
+ *   Patching the PMT to only declare the kept audio PID makes the TS stream
+ *   internally consistent and eliminates the freeze.
+ */
+function patchPmtPacket(
+  pktIn: Buffer,
+  keepAudioPid: number,
+  allAudioPids: Set<number>,
+): Buffer {
+  if (allAudioPids.size <= 1) return pktIn; // nothing to remove
+
+  const pkt = Buffer.from(pktIn); // work on a copy
+
+  // ── Locate PMT section payload ──────────────────────────────────────────────
+  const af = (pkt[3]! >> 4) & 0x03;
+  if (af === 0x02) return pkt; // adaptation-only packet — no payload
+  let payStart = 4;
+  if (af === 0x03) payStart = 4 + 1 + (pkt[4] ?? 0); // skip adaptation field
+
+  let pos = payStart;
+  if (pkt[1]! & 0x40) pos += 1 + (pkt[pos] ?? 0); // skip pointer_field when PUSI
+
+  if (pos + 12 > 188 || pkt[pos] !== 0x02) return pkt; // not a PMT table_id
+
+  const sectionBase = pos; // byte offset of table_id
+  const secLen = ((pkt[pos + 1]! & 0x0f) << 8) | pkt[pos + 2]!;
+  if (pos + 3 + secLen > 188) return pkt; // section overflows packet — malformed
+
+  const progInfoLen = ((pkt[pos + 10]! & 0x0f) << 8) | pkt[pos + 11]!;
+  const streamLoopStart = pos + 12 + progInfoLen;
+  const crcStart        = sectionBase + 3 + secLen - 4; // CRC is last 4 bytes
+
+  if (streamLoopStart > crcStart) return pkt; // malformed — no room for stream loop
+
+  // ── Parse stream loop, collect entries to keep ──────────────────────────────
+  const keptEntries: Buffer[] = [];
+  let sp = streamLoopStart;
+  while (sp + 5 <= crcStart) {
+    const ePid      = ((pkt[sp + 1]! & 0x1f) << 8) | pkt[sp + 2]!;
+    const esInfoLen = ((pkt[sp + 3]! & 0x0f) << 8) | pkt[sp + 4]!;
+    const entrySize = 5 + esInfoLen;
+    if (sp + entrySize > crcStart) break; // malformed entry — stop
+
+    const isDroppedAudio = allAudioPids.has(ePid) && ePid !== keepAudioPid;
+    if (!isDroppedAudio) keptEntries.push(pkt.subarray(sp, sp + entrySize));
+    sp += entrySize;
+  }
+
+  const newStreamLoop = Buffer.concat(keptEntries);
+
+  // ── Rewrite section_length ──────────────────────────────────────────────────
+  // section_length = fixed 9 bytes (prog_num…prog_info_len) + progInfoLen + stream loop + 4 CRC
+  const newSecLen = 9 + progInfoLen + newStreamLoop.length + 4;
+  pkt[pos + 1] = (pkt[pos + 1]! & 0xf0) | ((newSecLen >> 8) & 0x0f);
+  pkt[pos + 2] =  newSecLen & 0xff;
+
+  // ── Copy new stream loop in-place ───────────────────────────────────────────
+  newStreamLoop.copy(pkt, streamLoopStart);
+  const newCrcPos = streamLoopStart + newStreamLoop.length;
+
+  // ── Recalculate CRC-32 ──────────────────────────────────────────────────────
+  const crc = crc32mpeg(pkt, sectionBase, newCrcPos - sectionBase);
+  pkt[newCrcPos]     = (crc >>> 24) & 0xff;
+  pkt[newCrcPos + 1] = (crc >>> 16) & 0xff;
+  pkt[newCrcPos + 2] = (crc >>>  8) & 0xff;
+  pkt[newCrcPos + 3] =  crc & 0xff;
+
+  // ── Stuff remaining bytes (after CRC) with 0xFF ─────────────────────────────
+  pkt.fill(0xff, newCrcPos + 4, TS_PACKET_SIZE);
+
+  return pkt;
+}
+
 /**
  * Filter an MPEG-TS buffer to keep video + one audio PID.
  *
  * Keeps:
  *   - PAT packets (PID 0)
- *   - PMT packets (pmtPid)
+ *   - PMT packets (pmtPid) — rewritten to only declare the kept audio PID
  *   - All non-audio PIDs (video, data, etc.)
  *   - Only the selected audioPid
  *
@@ -183,13 +290,17 @@ export function probeAudioTracks(buf: Buffer, maxPackets = 40): ProbeResult {
  * play the selected language.  Used by /as-va to guarantee Hindi default
  * on players (LG TV) that ignore HLS DEFAULT= and play whatever audio PID
  * the TS stream presents first.
+ *
+ * The PMT is also patched (dropped PIDs removed, CRC recalculated) so that
+ * LG TV's strict native HLS decoder does not flag missing declared PIDs as
+ * a stream error and stall the video decoder.
  */
 export function filterVideoAndAudio(
   buf: Buffer,
   audioPid: number,
   pmtPid: number,
 ): Buffer {
-  // First pass: parse PMT to collect all audio PIDs in this segment.
+  // Pass 1: collect all audio PIDs declared in the PMT.
   const allAudioPids = new Set<number>();
   for (let i = 0; i + TS_PACKET_SIZE <= buf.length; i += TS_PACKET_SIZE) {
     if (buf[i] !== SYNC) continue;
@@ -200,13 +311,22 @@ export function filterVideoAndAudio(
     }
   }
 
-  // Second pass: drop all audio PIDs except the selected one.
+  // Pass 2: build output — drop dropped-audio packets; patch PMT entries.
   const chunks: Buffer[] = [];
   for (let i = 0; i + TS_PACKET_SIZE <= buf.length; i += TS_PACKET_SIZE) {
     if (buf[i] !== SYNC) continue;
     const pid = readPid(buf, i);
     const isOtherAudio = allAudioPids.has(pid) && pid !== audioPid;
-    if (!isOtherAudio) {
+    if (isOtherAudio) continue; // drop this packet entirely
+
+    if (pid === pmtPid && hasPUSI(buf, i) && allAudioPids.size > 1) {
+      // Patch the PMT so it only declares the kept audio PID.
+      // LG TV's WebOS native player is strict: if the PMT declares PIDs that
+      // are absent from the packet stream it stalls the video decoder even
+      // though the audio buffer keeps playing — producing "video freeze, audio
+      // OK" symptoms that don't reproduce on Android ExoPlayer.
+      chunks.push(patchPmtPacket(buf.subarray(i, i + TS_PACKET_SIZE), audioPid, allAudioPids));
+    } else {
       chunks.push(buf.subarray(i, i + TS_PACKET_SIZE));
     }
   }
