@@ -1253,23 +1253,24 @@ router.get("/m3u8", async (req: Request, res: Response) => {
               { targetUrl: targetUrl.slice(0, 80), tracks: tracks.map(t => `${t.name}(${t.pid})`), pmtPid },
               "M3U8 proxy: TS audio probe result"
             );
-            const hindiM3u8 = tracks.find(
-              t => /hindi/i.test(t.name) || t.language === "hin" || t.language === "hi"
-            );
-            const tracksToServe = hindiM3u8 ? [hindiM3u8] : tracks;
-            if (tracksToServe.length > 0 && (hindiM3u8 || tracks.length > 1)) {
+            if (tracks.length > 1) {
               const encVariant = encodeURIComponent(targetUrl);
               const pmtStr = String(pmtPid);
               const variantProxied = `${proxyBase}/m3u8?url=${encVariant}&referer=${refEnc}&origin=${orgEnc}`;
 
-              const mediaLines = tracksToServe.map((t) => {
+              const hindiIdxM3u8 = tracks.findIndex(
+                t => /hindi/i.test(t.name) || t.language === "hin" || t.language === "hi"
+              );
+              const defaultIdxM3u8 = hindiIdxM3u8 >= 0 ? hindiIdxM3u8 : 0;
+
+              const mediaLines = tracks.map((t, i) => {
                 const audioPlUrl =
                   `${proxyBase}/as-audio-pl?variantUrl=${encVariant}` +
                   `&pid=${t.pid}&pmtpid=${pmtStr}&ref=${refEnc}&org=${orgEnc}`;
                 return (
                   `#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",` +
-                  `LANGUAGE="${t.language || "hin"}",NAME="${t.name}",` +
-                  `DEFAULT=YES,AUTOSELECT=YES,` +
+                  `LANGUAGE="${t.language || `und${i}`}",NAME="${t.name}",` +
+                  `DEFAULT=${i === defaultIdxM3u8 ? "YES" : "NO"},AUTOSELECT=YES,` +
                   `URI="${audioPlUrl}"`
                 );
               });
@@ -1689,34 +1690,33 @@ async function computeRelayM3u8(hash: string, playerCdn: string, proxyBase: stri
     return proxyUrl(absUrl, isPlaylist);
   }).join("\n");
 
-  // If we're wrapping a CDN variant and detected audio tracks, synthesise a
-  // proper HLS master playlist with #EXT-X-MEDIA:TYPE=AUDIO entries.
-  // We filter to ONLY the Hindi track so that LG TV (which ignores the audio
-  // selector UI and just plays the DEFAULT track) always gets Hindi audio.
-  // If no Hindi track is detected we fall back to all tracks (existing behaviour).
-  const hindiTrack = detectedTracks.find(
-    t => /hindi/i.test(t.name) || t.language === "hin" || t.language === "hi"
-  );
-  const tracksForMaster = hindiTrack ? [hindiTrack] : detectedTracks;
-
-  if (isVariant && tracksForMaster.length > 0 && (hindiTrack || detectedTracks.length > 1)) {
+  // If we're wrapping a CDN variant and detected multiple audio tracks,
+  // synthesise a proper HLS master playlist with #EXT-X-MEDIA:TYPE=AUDIO
+  // entries pointing to our per-PID audio rendition proxy endpoints.
+  // Video playback is fully unchanged — the variant URL is unmodified.
+  if (isVariant && detectedTracks.length > 1) {
     const variantProxied = `${proxyBase}/m3u8?url=${encodeURIComponent(m3u8Url)}&referer=${refEnc}&origin=${orgEnc}`;
     const encVariant = encodeURIComponent(m3u8Url);
     const pmtStr = String(detectedPmtPid);
 
-    const mediaLines = tracksForMaster.map((t) => {
+    const hindiIdx = detectedTracks.findIndex(
+      t => /hindi/i.test(t.name) || t.language === "hin" || t.language === "hi"
+    );
+    const defaultIdx = hindiIdx >= 0 ? hindiIdx : 0;
+
+    const mediaLines = detectedTracks.map((t, i) => {
       const audioPlUrl =
         `${proxyBase}/as-audio-pl?variantUrl=${encVariant}` +
         `&pid=${t.pid}&pmtpid=${pmtStr}&ref=${refEnc}&org=${orgEnc}`;
       return (
         `#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",` +
-        `LANGUAGE="${t.language || "hin"}",NAME="${t.name}",` +
-        `DEFAULT=YES,AUTOSELECT=YES,` +
+        `LANGUAGE="${t.language || `und${i}`}",NAME="${t.name}",` +
+        `DEFAULT=${i === defaultIdx ? "YES" : "NO"},AUTOSELECT=YES,` +
         `URI="${audioPlUrl}"`
       );
     });
 
-    logger.info({ hash, totalTracks: detectedTracks.length, serving: tracksForMaster.map(t => t.name) }, "AnimeSalt relay: serving synthetic HLS master (Hindi-filtered)");
+    logger.info({ hash, tracks: detectedTracks.length, defaultTrack: detectedTracks[defaultIdx]?.name }, "AnimeSalt relay: serving synthetic HLS master with audio renditions");
 
     return [
       "#EXTM3U",
