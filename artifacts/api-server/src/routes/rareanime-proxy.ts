@@ -90,33 +90,6 @@ function rewriteM3u8(
 }
 
 /**
- * Strip #EXT-X-BYTERANGE lines from any HLS playlist.
- *
- * groovy.monster emits byte-range hints with cumulative @OFFSET values even
- * though every segment URL is a completely independent chunk (a different signed
- * CDN path each time).  Strict HLS players — LG WebOS, HLS.js in the Stremio
- * web app — honour the EXT-X-BYTERANGE spec literally: they send a
- * "Range: bytes=OFFSET-END" request header to the segment URL.  Because the
- * offset is cumulative (0, 270 532, 595 960 …) but the URL only contains the
- * bytes of *that* chunk (starting at 0), the CDN returns a 416 Range Not
- * Satisfiable → "Video is not supported".
- *
- * Android ExoPlayer is lenient and ignores the Range-vs-200 mismatch.
- *
- * Dropping EXT-X-BYTERANGE makes every player fetch each URL without a Range
- * header and receive the full chunk, which is exactly what those URLs serve.
- * EXT-X-VERSION:3 is sufficient once byte-range is gone (and is compatible with
- * all LG TV, HLS.js and ExoPlayer versions in the wild).
- */
-function stripByteRange(content: string): string {
-  return content
-    .split("\n")
-    .filter((line) => !line.trim().startsWith("#EXT-X-BYTERANGE"))
-    .join("\n")
-    .replace(/#EXT-X-VERSION:\d+/g, "#EXT-X-VERSION:3");
-}
-
-/**
  * If `content` is a master HLS playlist (contains #EXT-X-STREAM-INF),
  * rewrite it to expose ONLY the single highest-bandwidth variant.
  *
@@ -324,20 +297,15 @@ raProxyRouter.get("/hls/master.m3u8", async (req: Request, res: Response) => {
     // quality switches that cause MPEG-TS decoder errors.
     const filtered = filterToSingleVariant(rewritten);
 
-    // Step 3: strip EXT-X-BYTERANGE hints.  groovy.monster attaches cumulative
-    // byte offsets to independent chunk URLs; strict players (LG TV, HLS.js)
-    // send Range requests that the CDN cannot satisfy → "Video is not supported".
-    const final = stripByteRange(filtered);
-
     logger.info(
-      { url: targetUrl.slice(0, 80), lines: final.split("\n").length },
+      { url: targetUrl.slice(0, 80), lines: filtered.split("\n").length },
       "[RareAnimeProxy] m3u8 rewritten OK"
     );
 
     res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Cache-Control", "no-cache, no-store");
-    res.send(final);
+    res.send(filtered);
   } catch (err) {
     logger.error(
       { err: (err as Error).message, url: targetUrl.slice(0, 100) },
@@ -411,22 +379,46 @@ raProxyRouter.get("/hls/seg", async (req: Request, res: Response) => {
       const addonBase = addonBaseUrl(req);
       const rewritten = rewriteM3u8(text, targetUrl, addonBase, referer, ckEncoded);
       const filtered = filterToSingleVariant(rewritten);
-      const final = stripByteRange(filtered);
       res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
       res.setHeader("Cache-Control", "no-cache, no-store");
-      res.send(final);
+      res.send(filtered);
     } else {
-      // Binary segment — stream through directly
-      if (upstream.headers["content-length"]) {
-        res.setHeader("Content-Length", upstream.headers["content-length"] as string);
-      }
-      if (upstream.headers["content-range"]) {
-        res.setHeader("Content-Range", upstream.headers["content-range"] as string);
-      }
-      // Accept-Ranges: bytes lets players seek within a segment if needed.
+      // Binary segment — stream through with correct Range / partial-content support.
+      //
+      // groovy.monster playlists use #EXT-X-BYTERANGE with *cumulative* byte offsets
+      // across independent chunk URLs.  When the player sees e.g.
+      //   #EXT-X-BYTERANGE:325428@270532   <chunk-2-url>
+      // it sends "Range: bytes=270532-595959" to our proxy.  We fetch the full chunk
+      // from the CDN (no Range header forwarded — the CDN serves each chunk from
+      // byte 0) and respond as 206 Partial Content claiming the range the player
+      // asked for.  This works because the chunk size always equals (end - start + 1)
+      // from the playlist — the data IS the right bytes for that range.
+      //
+      // This satisfies both:
+      //   • Initial playback  — player sends Range for segment 0  (@0)  → 206 ✓
+      //   • Seeking           — player sends Range for segment N  (@X)  → 206 ✓
+      //   • Android ExoPlayer — sends no Range or ignores 206 either way ✓
+      const clientRange = req.headers["range"] as string | undefined;
+      const contentLen = upstream.headers["content-length"] as string | undefined;
+
       res.setHeader("Accept-Ranges", "bytes");
       res.setHeader("Content-Type", contentType || "video/mp2t");
       res.setHeader("Cache-Control", "public, max-age=3600");
+      if (contentLen) res.setHeader("Content-Length", contentLen);
+
+      if (clientRange && upstream.status === 200) {
+        // Player sent a Range request (driven by #EXT-X-BYTERANGE).
+        // Return 206 with a Content-Range that mirrors the requested range.
+        // The body is the full chunk from CDN which *is* the data for that range.
+        const m = /bytes=(\d+)-(\d+)/.exec(clientRange);
+        if (m) {
+          res.setHeader("Content-Range", `bytes ${m[1]}-${m[2]}/*`);
+          res.status(206);
+        }
+      } else if (upstream.headers["content-range"]) {
+        res.setHeader("Content-Range", upstream.headers["content-range"] as string);
+      }
+
       (upstream.data as NodeJS.ReadableStream).pipe(res);
     }
   } catch (err) {
