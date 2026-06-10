@@ -1158,8 +1158,17 @@ const AS_BROWSER_EXTRA: Record<string, string> = {
 // /api/m3u8?url=<enc>&referer=<enc>&origin=<enc>
 // referer and origin are optional — defaults keep AnimeSalt backward-compat.
 router.get("/m3u8", async (req: Request, res: Response) => {
-  const { url, referer: refParam, origin: originParam } = req.query as Record<string, string | undefined>;
+  const { url, referer: refParam, origin: originParam, audiopid: audiopidParam, pmtpid: pmtpidParam } =
+    req.query as Record<string, string | undefined>;
   if (!url) { res.status(400).json({ error: "Missing url" }); return; }
+
+  // When audiopid is set, the caller wants every TS segment filtered to keep
+  // only that audio PID (+ video/PAT/PMT).  Segments go through /as-va instead
+  // of /seg, and the inner synthetic-master logic is skipped.
+  const filterAudioPidNum = audiopidParam ? parseInt(audiopidParam, 10) : undefined;
+  const filterPmtPidNum   = pmtpidParam   ? parseInt(pmtpidParam, 10)   : undefined;
+  const doAudioFilter = filterAudioPidNum !== undefined && isFinite(filterAudioPidNum) &&
+                        filterPmtPidNum   !== undefined && isFinite(filterPmtPidNum);
 
   let targetUrl: string;
   try {
@@ -1215,10 +1224,21 @@ router.get("/m3u8", async (req: Request, res: Response) => {
     const refEnc = encodeURIComponent(effectiveReferer);
     const orgEnc = encodeURIComponent(effectiveOrigin);
 
-    const proxyUrl = (absUrl: string, isPlaylist: boolean): string =>
-      isPlaylist
-        ? `${proxyBase}/m3u8?url=${encodeURIComponent(absUrl)}&referer=${refEnc}&origin=${orgEnc}`
-        : `${proxyBase}/seg?u=${encodeURIComponent(absUrl)}&ref=${refEnc}&org=${orgEnc}`;
+    const proxyUrl = (absUrl: string, isPlaylist: boolean): string => {
+      if (isPlaylist) {
+        return `${proxyBase}/m3u8?url=${encodeURIComponent(absUrl)}&referer=${refEnc}&origin=${orgEnc}`;
+      }
+      // When audio-filtering is requested, route every TS segment through /as-va
+      // so it strips all audio PIDs except the chosen one before delivery.
+      if (doAudioFilter) {
+        return (
+          `${proxyBase}/as-va?url=${encodeURIComponent(absUrl)}` +
+          `&audiopid=${filterAudioPidNum}&pmtpid=${filterPmtPidNum}` +
+          `&ref=${refEnc}&org=${orgEnc}`
+        );
+      }
+      return `${proxyBase}/seg?u=${encodeURIComponent(absUrl)}&ref=${refEnc}&org=${orgEnc}`;
+    };
 
     // Detect whether the CDN returned a variant or master playlist.
     // A variant has #EXTINF segment entries directly; a master has #EXT-X-STREAM-INF.
@@ -1227,8 +1247,10 @@ router.get("/m3u8", async (req: Request, res: Response) => {
     // For AnimeSalt CDN variant playlists, probe the first TS segment for muxed
     // audio PIDs and synthesise a proper HLS master with #EXT-X-MEDIA:TYPE=AUDIO
     // so LG TV's native player shows a language selector.
-    // Only runs for AnimeSalt CDN hostnames to avoid probing other providers.
-    if (isVariantPlaylist && /as-cdn\d*\.top/i.test(parsed.hostname)) {
+    // Only runs for AnimeSalt CDN hostnames AND when the caller did not already
+    // request audio filtering (doAudioFilter means we're already serving filtered
+    // segments — no need for another synthetic master layer).
+    if (isVariantPlaylist && /as-cdn\d*\.top/i.test(parsed.hostname) && !doAudioFilter) {
       const firstSegRel = text.split("\n").find(l => { const t = l.trim(); return t && !t.startsWith("#"); });
       if (firstSegRel) {
         const firstSegUrl = firstSegRel.trim().startsWith("http") ? firstSegRel.trim()
@@ -1711,14 +1733,15 @@ async function computeRelayM3u8(hash: string, playerCdn: string, proxyBase: stri
 
     const hindiTrack = orderedTracks[0]!;
 
-    // The main variant stream is served through /as-va-pl, which strips all
-    // audio PIDs except Hindi from every TS segment.  LG TV (which ignores
-    // DEFAULT= flags and plays the first audio PID in the TS) therefore has
-    // no choice but to play Hindi.  Android users can still switch via the
-    // #EXT-X-MEDIA renditions below.
-    const hindiVariantUrl =
-      `${proxyBase}/as-va-pl?variantUrl=${encVariant}` +
-      `&audiopid=${hindiTrack.pid}&pmtpid=${pmtStr}&ref=${refEnc}&org=${orgEnc}`;
+    // Route the main variant through /m3u8 with audiopid=<hindiPid> so that
+    // the /m3u8 route rewrites every TS segment URL to /as-va, which strips
+    // all audio PIDs except Hindi from each segment.  LG TV (which ignores
+    // HLS DEFAULT= flags and just plays the first audio PID found in the TS)
+    // therefore has no choice but to play Hindi.  Android users can still
+    // switch via the #EXT-X-MEDIA renditions below.
+    const variantWithHindi =
+      `${proxyBase}/m3u8?url=${encVariant}&referer=${refEnc}&origin=${orgEnc}` +
+      `&audiopid=${hindiTrack.pid}&pmtpid=${pmtStr}`;
 
     const mediaLines = orderedTracks.map((t, i) => {
       const audioPlUrl =
@@ -1741,7 +1764,7 @@ async function computeRelayM3u8(hash: string, playerCdn: string, proxyBase: stri
       ...mediaLines,
       "",
       `#EXT-X-STREAM-INF:BANDWIDTH=2000000,CODECS="avc1.42c01f,mp4a.40.2",AUDIO="audio"`,
-      hindiVariantUrl,
+      variantWithHindi,
     ].join("\n");
   }
 
