@@ -1554,6 +1554,57 @@ const relayResultCache = new Map<string, RelayCache>();
 const relayInFlight = new Map<string, Promise<string>>();
 const RELAY_TTL_MS = 90_000;
 
+/**
+ * Post-processes a proxied HLS master playlist so that the Hindi audio
+ * rendition is listed FIRST and has DEFAULT=YES, while all other audio
+ * renditions have DEFAULT=NO.
+ *
+ * Why: AnimeSalt's CDN emits all three renditions (tel/tam/hin) with
+ * DEFAULT=NO.  LG TV selects the first-listed rendition regardless of
+ * DEFAULT= flags, so without this fix Telugu always plays on LG TV.
+ * This is a no-op if the playlist has no Hindi #EXT-X-MEDIA:TYPE=AUDIO line.
+ */
+function putHindiFirstInMaster(m3u8: string): string {
+  const isHindiLine = (line: string): boolean => {
+    const lang = (line.match(/LANGUAGE="([^"]+)"/)?.[1] ?? "").toLowerCase();
+    const name = (line.match(/NAME="([^"]+)"/)?.[1] ?? "").toLowerCase();
+    return lang === "hin" || lang === "hi" || /hindi/.test(name);
+  };
+
+  const isAudioMedia = (line: string): boolean =>
+    line.startsWith("#EXT-X-MEDIA") && /TYPE=AUDIO/i.test(line);
+
+  const lines = m3u8.split("\n");
+
+  let hindiLine: string | null = null;
+  const otherAudioLines: string[] = [];
+  const rest: string[] = [];
+  let firstAudioInsertIdx = -1;
+
+  for (const line of lines) {
+    if (isAudioMedia(line)) {
+      if (firstAudioInsertIdx === -1) firstAudioInsertIdx = rest.length;
+      const updated = line.replace(/DEFAULT=(YES|NO)/i, `DEFAULT=${isHindiLine(line) ? "YES" : "NO"}`);
+      if (isHindiLine(line)) {
+        hindiLine = updated;
+      } else {
+        otherAudioLines.push(updated);
+      }
+    } else {
+      rest.push(line);
+    }
+  }
+
+  if (hindiLine === null || firstAudioInsertIdx === -1) return m3u8;
+
+  const ordered = [hindiLine, ...otherAudioLines];
+  return [
+    ...rest.slice(0, firstAudioInsertIdx),
+    ...ordered,
+    ...rest.slice(firstAudioInsertIdx),
+  ].join("\n");
+}
+
 async function computeRelayM3u8(hash: string, playerCdn: string, proxyBase: string): Promise<string> {
   const playerUrl = `${playerCdn}/video/${hash}`;
   const animesaltBase = "https://animesalt.ac";
@@ -1714,6 +1765,21 @@ async function computeRelayM3u8(hash: string, playerCdn: string, proxyBase: stri
     return proxyUrl(absUrl, isPlaylist);
   }).join("\n");
 
+  // For master playlists that have real #EXT-X-MEDIA:TYPE=AUDIO renditions,
+  // ensure Hindi is listed FIRST and has DEFAULT=YES.
+  //
+  // LG TV (and many TV players) select the audio rendition either by DEFAULT=YES
+  // or simply by playing the first listed rendition.  The AnimeSalt CDN master
+  // has all three tracks (tel/tam/hin) with DEFAULT=NO, so whichever comes first
+  // (typically Telugu) is what LG TV plays.  Moving Hindi first + setting
+  // DEFAULT=YES means LG TV plays Hindi out of the box regardless of its
+  // selection strategy.  Android users can still switch via the normal track
+  // selector — all three renditions remain in the playlist.
+  const withHindiFirst = putHindiFirstInMaster(rewritten);
+  if (withHindiFirst !== rewritten) {
+    logger.info({ hash }, "AnimeSalt relay: reordered audio renditions — Hindi first, DEFAULT=YES");
+  }
+
   // If we're wrapping a CDN variant and detected multiple audio tracks,
   // synthesise a proper HLS master playlist with #EXT-X-MEDIA:TYPE=AUDIO
   // entries pointing to our per-PID audio rendition proxy endpoints.
@@ -1768,7 +1834,7 @@ async function computeRelayM3u8(hash: string, playerCdn: string, proxyBase: stri
     ].join("\n");
   }
 
-  return rewritten;
+  return withHindiFirst;
 }
 
 // Returns a promise that resolves to the rewritten m3u8, using the cache and
