@@ -5,7 +5,7 @@ import { logDebug } from "../lib/debug-log.js";
 import { BASE_PATH } from "../lib/base-path.js";
 import { proxyFetch } from "../lib/proxy-fetch.js";
 import { extractSrtFromZip } from "../lib/opensubtitles.js";
-import { probeAudioTracks, filterAudioPid, filterVideoAndAudio } from "../lib/ts-audio.js";
+import { probeAudioTracks, filterAudioPid, filterVideoAndAudio, filterVideoOnly } from "../lib/ts-audio.js";
 
 const router = Router();
 
@@ -2277,13 +2277,30 @@ router.options("/as-va-pl", (_req, res) => {
 // ---------------------------------------------------------------------------
 // /as-va — video + single-audio TS segment filter
 //
-// Fetches a TS segment and strips all audio PIDs except the selected one,
-// while keeping video, PAT, PMT, and any other non-audio PIDs intact.
+// Fetches a TS segment and strips ALL audio PIDs, returning a video-only TS.
+//
+// Why video-only instead of keeping one audio track:
+//   The HLS master we generate includes AUDIO="audio" in #EXT-X-STREAM-INF,
+//   which tells every conformant HLS player to use a separate #EXT-X-MEDIA
+//   rendition for audio rather than the muxed audio in the variant TS.
+//   Android ExoPlayer (and most software players) honour this correctly and
+//   ignore any muxed audio.  LG TV WebOS however fetches BOTH the muxed audio
+//   AND the rendition audio and tries to keep them in sync.  The two audio
+//   streams arrive over different HTTP connections with different buffering
+//   latencies; as they drift apart LG TV's GStreamer player stalls the video
+//   decoder while the audio buffer plays out — the classic "video freeze, audio
+//   continues" bug that does not reproduce on Android.
+//
+//   Making the variant TS video-only eliminates the double-audio condition: LG
+//   TV (and Android) both use the Hindi #EXT-X-MEDIA rendition (DEFAULT=YES,
+//   listed first) for audio.  Language switching via other renditions continues
+//   to work on all platforms.
 //
 // Query params:
 //   url       — URL-encoded raw CDN segment URL
-//   audiopid  — MPEG-TS audio PID to keep
-//   pmtpid    — MPEG-TS PMT PID to keep
+//   audiopid  — MPEG-TS audio PID (kept in URL for cache-busting / debugging;
+//               no longer used for filtering — all audio is stripped)
+//   pmtpid    — MPEG-TS PMT PID (used to patch the PMT table)
 //   ref       — URL-encoded Referer to forward to CDN
 //   org       — URL-encoded Origin to forward to CDN
 // ---------------------------------------------------------------------------
@@ -2291,11 +2308,14 @@ router.get("/as-va", async (req: Request, res: Response) => {
   const { url: urlEnc, audiopid: audiopidStr, pmtpid: pmtpidStr, ref: refEnc, org: orgEnc } =
     req.query as Record<string, string | undefined>;
 
-  if (!urlEnc || !audiopidStr || !pmtpidStr) { res.status(400).end(); return; }
+  if (!urlEnc || !pmtpidStr) { res.status(400).end(); return; }
 
-  const audioPid = parseInt(audiopidStr, 10);
-  const pmtPid   = parseInt(pmtpidStr,   10);
-  if (!isFinite(audioPid) || !isFinite(pmtPid)) { res.status(400).end(); return; }
+  const pmtPid = parseInt(pmtpidStr, 10);
+  if (!isFinite(pmtPid)) { res.status(400).end(); return; }
+
+  // audiopid is accepted for backward-compat / cache-differentiation but is
+  // not used: filterVideoOnly strips all audio regardless.
+  void audiopidStr;
 
   let segUrl: string;
   try { segUrl = decodeURIComponent(urlEnc); new URL(segUrl); }
@@ -2318,7 +2338,7 @@ router.get("/as-va", async (req: Request, res: Response) => {
     if (!upstream.ok) { res.status(upstream.status).end(); return; }
 
     const raw      = Buffer.from(await upstream.arrayBuffer());
-    const filtered = filterVideoAndAudio(raw, audioPid, pmtPid);
+    const filtered = filterVideoOnly(raw, pmtPid);
 
     res.setHeader("Content-Type", "video/mp2t");
     res.setHeader("Access-Control-Allow-Origin", "*");

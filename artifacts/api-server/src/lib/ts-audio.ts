@@ -319,8 +319,9 @@ export function filterVideoAndAudio(
     const isOtherAudio = allAudioPids.has(pid) && pid !== audioPid;
     if (isOtherAudio) continue; // drop this packet entirely
 
-    if (pid === pmtPid && hasPUSI(buf, i) && allAudioPids.size > 1) {
-      // Patch the PMT so it only declares the kept audio PID.
+    if (pid === pmtPid && hasPUSI(buf, i) && allAudioPids.size > 0) {
+      // Patch the PMT so it only declares the kept audio PID (or no audio at
+      // all when audioPid < 0, i.e. video-only mode).
       // LG TV's WebOS native player is strict: if the PMT declares PIDs that
       // are absent from the packet stream it stalls the video decoder even
       // though the audio buffer keeps playing — producing "video freeze, audio
@@ -332,6 +333,28 @@ export function filterVideoAndAudio(
   }
 
   return chunks.length === 0 ? buf : Buffer.concat(chunks);
+}
+
+/**
+ * Filter an MPEG-TS buffer to keep VIDEO + PAT + PMT only — no audio at all.
+ *
+ * This is the correct output for the main video variant in a multi-audio HLS
+ * master that uses #EXT-X-MEDIA:TYPE=AUDIO rendition groups.  Per the HLS spec
+ * the player uses the rendition stream for audio and the variant TS for video;
+ * having audio also muxed into the variant TS causes LG TV WebOS's GStreamer
+ * player to receive the same audio from two independent sources simultaneously.
+ * The slight timing difference between the two delivery paths creates
+ * audio/video drift that the WebOS player cannot recover from — the video
+ * decoder stalls ("video freeze") while the audio buffer plays out.
+ * Android ExoPlayer silently ignores the muxed audio when an AUDIO= rendition
+ * group is active, so the bug only manifests on LG TV.
+ *
+ * Passing audioPid = -1 to filterVideoAndAudio safely drops every audio PID
+ * because no valid TS PID is ever negative.  The PMT is also patched to remove
+ * all audio stream-loop entries so the stream is fully self-consistent.
+ */
+export function filterVideoOnly(buf: Buffer, pmtPid: number): Buffer {
+  return filterVideoAndAudio(buf, -1, pmtPid);
 }
 
 /**
