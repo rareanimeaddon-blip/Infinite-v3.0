@@ -1261,16 +1261,18 @@ router.get("/m3u8", async (req: Request, res: Response) => {
               const hindiIdxM3u8 = tracks.findIndex(
                 t => /hindi/i.test(t.name) || t.language === "hin" || t.language === "hi"
               );
-              const defaultIdxM3u8 = hindiIdxM3u8 >= 0 ? hindiIdxM3u8 : 0;
+              const orderedM3u8 = hindiIdxM3u8 > 0
+                ? [tracks[hindiIdxM3u8]!, ...tracks.filter((_, i) => i !== hindiIdxM3u8)]
+                : tracks;
 
-              const mediaLines = tracks.map((t, i) => {
+              const mediaLines = orderedM3u8.map((t, i) => {
                 const audioPlUrl =
                   `${proxyBase}/as-audio-pl?variantUrl=${encVariant}` +
                   `&pid=${t.pid}&pmtpid=${pmtStr}&ref=${refEnc}&org=${orgEnc}`;
                 return (
                   `#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",` +
                   `LANGUAGE="${t.language || `und${i}`}",NAME="${t.name}",` +
-                  `DEFAULT=${i === defaultIdxM3u8 ? "YES" : "NO"},AUTOSELECT=YES,` +
+                  `DEFAULT=${i === 0 ? "YES" : "NO"},AUTOSELECT=YES,` +
                   `URI="${audioPlUrl}"`
                 );
               });
@@ -1699,24 +1701,28 @@ async function computeRelayM3u8(hash: string, playerCdn: string, proxyBase: stri
     const encVariant = encodeURIComponent(m3u8Url);
     const pmtStr = String(detectedPmtPid);
 
+    // Move Hindi track to front so LG TV (which plays the first listed track)
+    // auto-plays Hindi. Also mark it DEFAULT=YES per the HLS spec.
     const hindiIdx = detectedTracks.findIndex(
       t => /hindi/i.test(t.name) || t.language === "hin" || t.language === "hi"
     );
-    const defaultIdx = hindiIdx >= 0 ? hindiIdx : 0;
+    const orderedTracks = hindiIdx > 0
+      ? [detectedTracks[hindiIdx]!, ...detectedTracks.filter((_, i) => i !== hindiIdx)]
+      : detectedTracks;
 
-    const mediaLines = detectedTracks.map((t, i) => {
+    const mediaLines = orderedTracks.map((t, i) => {
       const audioPlUrl =
         `${proxyBase}/as-audio-pl?variantUrl=${encVariant}` +
         `&pid=${t.pid}&pmtpid=${pmtStr}&ref=${refEnc}&org=${orgEnc}`;
       return (
         `#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",` +
         `LANGUAGE="${t.language || `und${i}`}",NAME="${t.name}",` +
-        `DEFAULT=${i === defaultIdx ? "YES" : "NO"},AUTOSELECT=YES,` +
+        `DEFAULT=${i === 0 ? "YES" : "NO"},AUTOSELECT=YES,` +
         `URI="${audioPlUrl}"`
       );
     });
 
-    logger.info({ hash, tracks: detectedTracks.length, defaultTrack: detectedTracks[defaultIdx]?.name }, "AnimeSalt relay: serving synthetic HLS master with audio renditions");
+    logger.info({ hash, tracks: detectedTracks.length, defaultTrack: orderedTracks[0]?.name }, "AnimeSalt relay: serving synthetic HLS master with audio renditions");
 
     return [
       "#EXTM3U",
