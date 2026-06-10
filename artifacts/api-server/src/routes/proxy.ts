@@ -1243,6 +1243,19 @@ router.get("/m3u8", async (req: Request, res: Response) => {
         });
       }
 
+      // Proxy fMP4/CMAF init segment URIs (#EXT-X-MAP:URI="...") through the
+      // segment proxy so that the CDN's Referer/Origin token check is satisfied.
+      // Without this, LG TV and other players fetch the init segment directly
+      // from the CDN, get a 403, and audio renditions silently fail — meaning
+      // the player never shows the audio track selector.
+      if (trimmed.startsWith("#EXT-X-MAP") && trimmed.includes('URI="')) {
+        nextLineIsVariant = false;
+        return line.replace(/URI="([^"]+)"/g, (_m, uri: string) => {
+          const abs = toAbsUrl(uri);
+          return `URI="${proxyUrl(abs, false)}"`;
+        });
+      }
+
       if (trimmed.startsWith("#EXT-X-STREAM-INF")) {
         nextLineIsVariant = true;
         return line;
@@ -1528,6 +1541,16 @@ async function computeRelayM3u8(hash: string, playerCdn: string, proxyBase: stri
       );
     }
     if (trimmed.startsWith("#EXT-X-KEY") && trimmed.includes('URI="')) {
+      nextLineIsVariant = false;
+      return line.replace(/URI="([^"]+)"/g, (_m, uri: string) =>
+        `URI="${proxyUrl(toAbsUrl(uri), false)}"`
+      );
+    }
+    // Proxy fMP4/CMAF init segment URIs so the CDN's Referer/Origin token check
+    // is satisfied for audio rendition init segments.  Without this the player
+    // fetches init-audio.mp4 directly from the CDN (wrong IP/headers) → 403 →
+    // the audio rendition silently fails and LG TV never shows the track selector.
+    if (trimmed.startsWith("#EXT-X-MAP") && trimmed.includes('URI="')) {
       nextLineIsVariant = false;
       return line.replace(/URI="([^"]+)"/g, (_m, uri: string) =>
         `URI="${proxyUrl(toAbsUrl(uri), false)}"`
