@@ -16,18 +16,6 @@ export async function extractHubCloud(
   try {
     const uri = new URL(url);
     const baseUrl = `${uri.protocol}//${uri.host}`;
-    // HubCloud base URL used as Referer/Origin for the hosted file buckets.
-    // Backblaze B2 / FSL / S3 buckets enforce hotlink protection and return
-    // 403 when no Referer is present.  Attaching the HubCloud origin as the
-    // Referer satisfies that check.  These headers are picked up by
-    // hd4uStreamToStremio / fourkdStreamToStremio and used to proxy the file
-    // through the addon server so the headers are always sent correctly.
-    const hubReferer = `${baseUrl}/`;
-    const hubOrigin = baseUrl;
-    const bucketHeaders: Record<string, string> = {
-      Referer: hubReferer,
-      Origin: hubOrigin,
-    };
 
     let href: string;
     if (url.includes("hubcloud.php")) {
@@ -45,6 +33,15 @@ export async function extractHubCloud(
       logger.warn({ url }, `${TAG}: no href found`);
       return streams;
     }
+
+    // Use the download page URL as Referer — that is what the browser sends
+    // when a user clicks the FSL/S3/Direct button on the HubCloud download page.
+    // Backblaze B2 / FSL / S3 buckets check the Referer against the originating
+    // page URL, not the root HubCloud domain.  Origin stays as the base domain.
+    const bucketHeaders: Record<string, string> = {
+      Referer: href.endsWith("/") ? href : `${href}/`,
+      Origin: baseUrl,
+    };
 
     logger.info({ href }, `${TAG}: fetching download page`);
     const downloadHtml = await getHtml(href);

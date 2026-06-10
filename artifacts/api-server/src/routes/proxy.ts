@@ -21,6 +21,36 @@ function decodeParam(s: string): string {
   return Buffer.from(s, "base64url").toString("utf8");
 }
 
+/**
+ * Follow HTTP redirects manually so we can preserve custom headers (especially
+ * Referer) across hops.  The native `redirect: "follow"` strips Referer on
+ * cross-origin redirects per the browser spec, which breaks FSL/S3 CDN links
+ * that validate the Referer header at every step of their redirect chain.
+ */
+async function fetchWithRedirects(
+  url: string,
+  headers: Record<string, string>,
+  maxRedirects = 8,
+): Promise<globalThis.Response> {
+  let currentUrl = url;
+  for (let i = 0; i <= maxRedirects; i++) {
+    const res = await fetch(currentUrl, {
+      headers,
+      redirect: "manual",
+      signal: AbortSignal.timeout(30_000),
+    });
+    const status = res.status;
+    if (status === 301 || status === 302 || status === 303 || status === 307 || status === 308) {
+      const loc = res.headers.get("location");
+      if (!loc) return res;
+      currentUrl = loc.startsWith("http") ? loc : new URL(loc, currentUrl).href;
+      continue;
+    }
+    return res;
+  }
+  throw new Error("fetchWithRedirects: too many redirects");
+}
+
 async function pipeUpstream(
   targetUrl: string,
   cookie: string | undefined,
@@ -52,13 +82,19 @@ async function pipeUpstream(
   res.setHeader("Access-Control-Allow-Headers", "*");
   res.setHeader("Access-Control-Expose-Headers", "Content-Range, Accept-Ranges, Content-Length");
 
+  // Use manual redirect following when custom headers (Referer) are present so
+  // the Referer is preserved across all hops.  Plain requests use native follow.
+  const fetchFn = extraHeaders
+    ? () => fetchWithRedirects(targetUrl, upstreamHeaders)
+    : () => fetch(targetUrl, {
+        headers: upstreamHeaders,
+        redirect: "follow",
+        signal: AbortSignal.timeout(30_000),
+      });
+
   let upstream: globalThis.Response;
   try {
-    upstream = await fetch(targetUrl, {
-      headers: upstreamHeaders,
-      redirect: "follow",
-      signal: AbortSignal.timeout(30_000),
-    });
+    upstream = await fetchFn();
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     logger.error({ err, targetUrl }, "Upstream fetch failed");
