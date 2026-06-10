@@ -5,7 +5,7 @@ import { logDebug } from "../lib/debug-log.js";
 import { BASE_PATH } from "../lib/base-path.js";
 import { proxyFetch } from "../lib/proxy-fetch.js";
 import { extractSrtFromZip } from "../lib/opensubtitles.js";
-import { probeAudioTracks, filterAudioPid } from "../lib/ts-audio.js";
+import { probeAudioTracks, filterAudioPid, filterVideoAndAudio } from "../lib/ts-audio.js";
 
 const router = Router();
 
@@ -1701,14 +1701,24 @@ async function computeRelayM3u8(hash: string, playerCdn: string, proxyBase: stri
     const encVariant = encodeURIComponent(m3u8Url);
     const pmtStr = String(detectedPmtPid);
 
-    // Move Hindi track to front so LG TV (which plays the first listed track)
-    // auto-plays Hindi. Also mark it DEFAULT=YES per the HLS spec.
+    // Move Hindi track to front. Also mark it DEFAULT=YES per the HLS spec.
     const hindiIdx = detectedTracks.findIndex(
       t => /hindi/i.test(t.name) || t.language === "hin" || t.language === "hi"
     );
     const orderedTracks = hindiIdx > 0
       ? [detectedTracks[hindiIdx]!, ...detectedTracks.filter((_, i) => i !== hindiIdx)]
       : detectedTracks;
+
+    const hindiTrack = orderedTracks[0]!;
+
+    // The main variant stream is served through /as-va-pl, which strips all
+    // audio PIDs except Hindi from every TS segment.  LG TV (which ignores
+    // DEFAULT= flags and plays the first audio PID in the TS) therefore has
+    // no choice but to play Hindi.  Android users can still switch via the
+    // #EXT-X-MEDIA renditions below.
+    const hindiVariantUrl =
+      `${proxyBase}/as-va-pl?variantUrl=${encVariant}` +
+      `&audiopid=${hindiTrack.pid}&pmtpid=${pmtStr}&ref=${refEnc}&org=${orgEnc}`;
 
     const mediaLines = orderedTracks.map((t, i) => {
       const audioPlUrl =
@@ -1722,7 +1732,7 @@ async function computeRelayM3u8(hash: string, playerCdn: string, proxyBase: stri
       );
     });
 
-    logger.info({ hash, tracks: detectedTracks.length, defaultTrack: orderedTracks[0]?.name }, "AnimeSalt relay: serving synthetic HLS master with audio renditions");
+    logger.info({ hash, tracks: detectedTracks.length, defaultTrack: hindiTrack.name, hindiPid: hindiTrack.pid }, "AnimeSalt relay: serving synthetic HLS master with Hindi-filtered main variant");
 
     return [
       "#EXTM3U",
@@ -1731,7 +1741,7 @@ async function computeRelayM3u8(hash: string, playerCdn: string, proxyBase: stri
       ...mediaLines,
       "",
       `#EXT-X-STREAM-INF:BANDWIDTH=2000000,CODECS="avc1.42c01f,mp4a.40.2",AUDIO="audio"`,
-      variantProxied,
+      hindiVariantUrl,
     ].join("\n");
   }
 
@@ -1965,6 +1975,159 @@ router.get("/as-audio", async (req: Request, res: Response) => {
 });
 
 router.options("/as-audio", (_req, res) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Headers", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.status(204).end();
+});
+
+// ---------------------------------------------------------------------------
+// /as-va-pl — video + single-audio playlist proxy
+//
+// Fetches the original CDN variant playlist and rewrites every segment URL
+// to route through /as-va, which strips all audio PIDs except the chosen one.
+// This is used as the main #EXT-X-STREAM-INF URL in the AnimeSalt synthetic
+// HLS master so that LG TV (which ignores DEFAULT= flags and plays the first
+// audio PID in the TS) always plays Hindi.
+//
+// Query params:
+//   variantUrl  — URL-encoded raw CDN variant m3u8 URL
+//   audiopid    — the MPEG-TS audio PID to KEEP (all others are dropped)
+//   pmtpid      — the MPEG-TS PMT PID
+//   ref         — URL-encoded Referer header to forward to CDN
+//   org         — URL-encoded Origin header to forward to CDN
+// ---------------------------------------------------------------------------
+router.get("/as-va-pl", async (req: Request, res: Response) => {
+  const { variantUrl: variantUrlEnc, audiopid: audiopidStr, pmtpid: pmtpidStr, ref: refEnc, org: orgEnc } =
+    req.query as Record<string, string | undefined>;
+
+  if (!variantUrlEnc || !audiopidStr || !pmtpidStr) { res.status(400).end(); return; }
+
+  const audioPid = parseInt(audiopidStr, 10);
+  const pmtPid   = parseInt(pmtpidStr,   10);
+  if (!isFinite(audioPid) || !isFinite(pmtPid)) { res.status(400).end(); return; }
+
+  let variantUrl: string;
+  try { variantUrl = decodeURIComponent(variantUrlEnc); new URL(variantUrl); }
+  catch { res.status(400).end(); return; }
+
+  const referer = refEnc ? decodeURIComponent(refEnc) : undefined;
+  const origin  = orgEnc ? decodeURIComponent(orgEnc) : undefined;
+
+  const publicUrl     = process.env["PUBLIC_URL"];
+  const replitDomains = process.env["REPLIT_DOMAINS"];
+  const proto  = (req.headers["x-forwarded-proto"] as string | undefined) ?? "https";
+  const host   = (req.headers["x-forwarded-host"] as string | undefined) ?? (req.headers["host"] as string | undefined) ?? "localhost";
+  const base   = publicUrl
+    ? publicUrl.replace(/\/$/, "") + BASE_PATH
+    : replitDomains
+      ? `https://${replitDomains.split(",")[0]}${BASE_PATH}`
+      : `${proto}://${host}${BASE_PATH}`;
+
+  try {
+    const upstream = await fetch(variantUrl, {
+      headers: {
+        "User-Agent": AS_CDN_UA,
+        ...(referer ? { "Referer": referer } : {}),
+        ...(origin  ? { "Origin":  origin  } : {}),
+        ...AS_BROWSER_EXTRA,
+      },
+      signal: AbortSignal.timeout(15_000),
+      redirect: "follow",
+    });
+    if (!upstream.ok) { res.status(upstream.status).end(); return; }
+
+    const text   = await upstream.text();
+    const parsed = new URL(variantUrl);
+    const segBase = parsed.origin + parsed.pathname.replace(/[^/]+$/, "");
+
+    const rewritten = text.split("\n").map(line => {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) return line;
+      const absUrl = trimmed.startsWith("http") ? trimmed
+        : trimmed.startsWith("/") ? parsed.origin + trimmed
+        : segBase + trimmed;
+      return (
+        `${base}/as-va?url=${encodeURIComponent(absUrl)}&audiopid=${audioPid}&pmtpid=${pmtPid}` +
+        (referer ? `&ref=${encodeURIComponent(referer)}` : "") +
+        (origin  ? `&org=${encodeURIComponent(origin)}`  : "")
+      );
+    }).join("\n");
+
+    res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Cache-Control", "no-store");
+    res.send(rewritten);
+  } catch (err) {
+    logger.error({ err, variantUrl }, "as-va-pl error");
+    if (!res.headersSent) res.status(502).end();
+  }
+});
+
+router.options("/as-va-pl", (_req, res) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Headers", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.status(204).end();
+});
+
+// ---------------------------------------------------------------------------
+// /as-va — video + single-audio TS segment filter
+//
+// Fetches a TS segment and strips all audio PIDs except the selected one,
+// while keeping video, PAT, PMT, and any other non-audio PIDs intact.
+//
+// Query params:
+//   url       — URL-encoded raw CDN segment URL
+//   audiopid  — MPEG-TS audio PID to keep
+//   pmtpid    — MPEG-TS PMT PID to keep
+//   ref       — URL-encoded Referer to forward to CDN
+//   org       — URL-encoded Origin to forward to CDN
+// ---------------------------------------------------------------------------
+router.get("/as-va", async (req: Request, res: Response) => {
+  const { url: urlEnc, audiopid: audiopidStr, pmtpid: pmtpidStr, ref: refEnc, org: orgEnc } =
+    req.query as Record<string, string | undefined>;
+
+  if (!urlEnc || !audiopidStr || !pmtpidStr) { res.status(400).end(); return; }
+
+  const audioPid = parseInt(audiopidStr, 10);
+  const pmtPid   = parseInt(pmtpidStr,   10);
+  if (!isFinite(audioPid) || !isFinite(pmtPid)) { res.status(400).end(); return; }
+
+  let segUrl: string;
+  try { segUrl = decodeURIComponent(urlEnc); new URL(segUrl); }
+  catch { res.status(400).end(); return; }
+
+  const referer = refEnc ? decodeURIComponent(refEnc) : undefined;
+  const origin  = orgEnc ? decodeURIComponent(orgEnc) : undefined;
+
+  try {
+    const upstream = await fetch(segUrl, {
+      headers: {
+        "User-Agent": AS_CDN_UA,
+        ...(referer ? { "Referer": referer } : {}),
+        ...(origin  ? { "Origin":  origin  } : {}),
+        ...AS_BROWSER_EXTRA,
+      },
+      signal: AbortSignal.timeout(20_000),
+      redirect: "follow",
+    });
+    if (!upstream.ok) { res.status(upstream.status).end(); return; }
+
+    const raw      = Buffer.from(await upstream.arrayBuffer());
+    const filtered = filterVideoAndAudio(raw, audioPid, pmtPid);
+
+    res.setHeader("Content-Type", "video/mp2t");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Cache-Control", "no-store");
+    res.send(filtered);
+  } catch (err) {
+    logger.error({ err, segUrl }, "as-va error");
+    if (!res.headersSent) res.status(502).end();
+  }
+});
+
+router.options("/as-va", (_req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Headers", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");

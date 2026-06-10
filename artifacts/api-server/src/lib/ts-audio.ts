@@ -171,6 +171,50 @@ export function probeAudioTracks(buf: Buffer, maxPackets = 40): ProbeResult {
 }
 
 /**
+ * Filter an MPEG-TS buffer to keep video + one audio PID.
+ *
+ * Keeps:
+ *   - PAT packets (PID 0)
+ *   - PMT packets (pmtPid)
+ *   - All non-audio PIDs (video, data, etc.)
+ *   - Only the selected audioPid
+ *
+ * All OTHER audio PIDs are dropped so the player has no choice but to
+ * play the selected language.  Used by /as-va to guarantee Hindi default
+ * on players (LG TV) that ignore HLS DEFAULT= and play whatever audio PID
+ * the TS stream presents first.
+ */
+export function filterVideoAndAudio(
+  buf: Buffer,
+  audioPid: number,
+  pmtPid: number,
+): Buffer {
+  // First pass: parse PMT to collect all audio PIDs in this segment.
+  const allAudioPids = new Set<number>();
+  for (let i = 0; i + TS_PACKET_SIZE <= buf.length; i += TS_PACKET_SIZE) {
+    if (buf[i] !== SYNC) continue;
+    if (readPid(buf, i) === pmtPid && hasPUSI(buf, i)) {
+      const tracks = parsePMT(buf, i, pmtPid);
+      for (const t of tracks) allAudioPids.add(t.pid);
+      break;
+    }
+  }
+
+  // Second pass: drop all audio PIDs except the selected one.
+  const chunks: Buffer[] = [];
+  for (let i = 0; i + TS_PACKET_SIZE <= buf.length; i += TS_PACKET_SIZE) {
+    if (buf[i] !== SYNC) continue;
+    const pid = readPid(buf, i);
+    const isOtherAudio = allAudioPids.has(pid) && pid !== audioPid;
+    if (!isOtherAudio) {
+      chunks.push(buf.subarray(i, i + TS_PACKET_SIZE));
+    }
+  }
+
+  return chunks.length === 0 ? buf : Buffer.concat(chunks);
+}
+
+/**
  * Filter an MPEG-TS buffer to keep only:
  *   - PAT packets (PID 0) — program association table
  *   - PMT packets (pmtPid) — program map table
