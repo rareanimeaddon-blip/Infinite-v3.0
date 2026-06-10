@@ -653,4 +653,198 @@ window.addEventListener('load', runCheck);
 </html>`);
 });
 
+// ─── HLS manifest analyzer ───────────────────────────────────────────────────
+// GET /debug/manifest          → HTML tool page
+// GET /debug/manifest/analyze  → JSON analysis (fetches the given URL via server)
+//
+// Lets the user paste any /as-relay or /m3u8 URL and instantly see whether
+// #EXT-X-MEDIA:TYPE=AUDIO entries are present — without needing an LG TV.
+
+router.get("/debug/manifest", (_req, res) => {
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>HLS Manifest Analyzer</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#0f172a;color:#e2e8f0;font-family:system-ui,sans-serif;padding:24px}
+  h1{font-size:1.4rem;font-weight:700;margin-bottom:4px;color:#f8fafc}
+  .sub{color:#94a3b8;font-size:.85rem;margin-bottom:24px}
+  a{color:#60a5fa;text-decoration:none}a:hover{text-decoration:underline}
+  label{display:block;font-size:.8rem;color:#94a3b8;margin-bottom:6px;font-weight:500;text-transform:uppercase;letter-spacing:.05em}
+  input{width:100%;background:#1e293b;border:1px solid #334155;border-radius:8px;color:#f1f5f9;padding:10px 14px;font-size:.95rem;outline:none}
+  input:focus{border-color:#60a5fa}
+  button{background:#3b82f6;color:#fff;border:none;border-radius:8px;padding:10px 22px;font-size:.95rem;font-weight:600;cursor:pointer;margin-top:12px}
+  button:hover{background:#2563eb}button:disabled{opacity:.5;cursor:default}
+  .card{background:#1e293b;border:1px solid #334155;border-radius:12px;padding:20px;margin-top:24px}
+  .badge{display:inline-block;border-radius:5px;padding:2px 9px;font-size:.78rem;font-weight:700;margin-right:6px}
+  .green{background:#064e3b;color:#34d399}.red{background:#450a0a;color:#f87171}
+  .blue{background:#0c1a4a;color:#60a5fa}.grey{background:#1e293b;color:#94a3b8;border:1px solid #334155}
+  .track{background:#0f172a;border:1px solid #334155;border-radius:8px;padding:12px 16px;margin-top:10px;font-size:.88rem}
+  .track-name{font-weight:700;color:#f1f5f9;font-size:.95rem}
+  .track-kv{color:#94a3b8;margin-top:4px;word-break:break-all}
+  .track-uri{color:#60a5fa;margin-top:4px;word-break:break-all;font-size:.8rem}
+  pre{background:#0f172a;border:1px solid #334155;border-radius:8px;padding:16px;overflow-x:auto;font-size:.8rem;line-height:1.6;margin-top:10px;max-height:480px}
+  .hl-audio{color:#34d399;font-weight:600}
+  .hl-key{color:#fb923c}.hl-map{color:#a78bfa}.hl-stream{color:#60a5fa}
+  .hl-comment{color:#64748b}.hl-url{color:#e2e8f0}
+  #status{color:#94a3b8;font-size:.85rem;margin-top:8px;min-height:20px}
+  .summary-row{display:flex;gap:16px;flex-wrap:wrap;margin-top:16px}
+  .stat{background:#0f172a;border:1px solid #334155;border-radius:8px;padding:12px 18px;text-align:center}
+  .stat-num{font-size:1.8rem;font-weight:700;color:#f1f5f9}
+  .stat-label{font-size:.75rem;color:#94a3b8;margin-top:2px}
+</style>
+</head>
+<body>
+<p style="margin-bottom:16px"><a href="${BASE_PATH}/debug">← Debug Console</a></p>
+<h1>🎵 HLS Manifest Analyzer</h1>
+<p class="sub">Paste an <code>/as-relay</code> or <code>/m3u8</code> URL to see exactly what LG TV receives — no TV needed.</p>
+
+<label>Manifest URL</label>
+<input id="url" type="text" placeholder="https://…/api/as-relay?hash=…&amp;player=…" spellcheck="false">
+<br>
+<button id="btn" onclick="analyze()">Analyze</button>
+<p id="status"></p>
+<div id="out"></div>
+
+<script>
+async function analyze() {
+  const url = document.getElementById('url').value.trim();
+  if (!url) return;
+  const btn = document.getElementById('btn');
+  const status = document.getElementById('status');
+  const out = document.getElementById('out');
+  btn.disabled = true;
+  status.textContent = 'Fetching manifest through server…';
+  out.innerHTML = '';
+  try {
+    const r = await fetch('${BASE_PATH}/debug/manifest/analyze?url=' + encodeURIComponent(url));
+    const d = await r.json();
+    if (!r.ok) { status.textContent = 'Error: ' + (d.error || r.status); btn.disabled=false; return; }
+    status.textContent = '';
+    renderResult(d);
+  } catch(e) {
+    status.textContent = 'Fetch failed: ' + e.message;
+  }
+  btn.disabled = false;
+}
+
+function hl(line) {
+  const t = line.trim();
+  if (!t) return line;
+  if (t.startsWith('#EXT-X-MEDIA') && t.includes('TYPE=AUDIO')) return '<span class="hl-audio">' + esc(line) + '</span>';
+  if (t.startsWith('#EXT-X-KEY')) return '<span class="hl-key">' + esc(line) + '</span>';
+  if (t.startsWith('#EXT-X-MAP')) return '<span class="hl-map">' + esc(line) + '</span>';
+  if (t.startsWith('#EXT-X-STREAM-INF')) return '<span class="hl-stream">' + esc(line) + '</span>';
+  if (t.startsWith('#')) return '<span class="hl-comment">' + esc(line) + '</span>';
+  return '<span class="hl-url">' + esc(line) + '</span>';
+}
+function esc(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+function renderResult(d) {
+  const hasAudio = d.audioTracks.length > 0;
+  const verdict = hasAudio
+    ? '<span class="badge green">✅ ' + d.audioTracks.length + ' audio track' + (d.audioTracks.length>1?'s':'') + ' found</span>'
+    : '<span class="badge red">❌ No audio tracks in manifest</span>';
+
+  const tracksHtml = d.audioTracks.map(t => \`
+    <div class="track">
+      <div class="track-name">\${esc(t.name || '(unnamed)')}\${t.default ? ' <span class="badge green" style="font-size:.7rem">DEFAULT</span>' : ''}\${t.forced ? ' <span class="badge blue" style="font-size:.7rem">FORCED</span>' : ''}</div>
+      <div class="track-kv">Language: \${esc(t.language||'—')} &nbsp;|&nbsp; Group: \${esc(t.groupId||'—')}</div>
+      \${t.uri ? '<div class="track-uri">Rendition playlist: <a href="' + esc(t.uri) + '" target="_blank">' + esc(t.uri.length > 80 ? t.uri.slice(0,80)+'…' : t.uri) + '</a></div>' : '<div class="track-kv" style="color:#f87171">⚠ No URI — in-band/muxed audio only; players cannot switch tracks</div>'}
+    </div>
+  \`).join('');
+
+  const lines = d.raw.split('\\n');
+  const highlighted = lines.map(hl).join('\\n');
+
+  document.getElementById('out').innerHTML = \`
+    <div class="card">
+      <div>\${verdict}
+        \${d.hasMap ? '<span class="badge blue" style="background:#1e1b4b;color:#a78bfa">#EXT-X-MAP (fMP4/CMAF) — proxied ✅</span>' : '<span class="badge grey">#EXT-X-MAP absent (TS segments)</span>'}
+        \${d.variantCount ? '<span class="badge grey">' + d.variantCount + ' quality variants</span>' : ''}
+      </div>
+
+      \${hasAudio ? '<div style="margin-top:12px;font-size:.85rem;color:#34d399;font-weight:600">LG TV should display the audio track selector ✅</div>' : '<div style="margin-top:12px;font-size:.85rem;color:#f87171">The CDN is not serving separate audio renditions — LG TV cannot show a selector. The audio is muxed inside the video segments.</div>'}
+
+      \${tracksHtml ? '<div style="margin-top:16px"><div style="font-size:.8rem;color:#94a3b8;font-weight:600;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px">Audio Renditions</div>' + tracksHtml + '</div>' : ''}
+
+      <div style="margin-top:20px">
+        <div style="font-size:.8rem;color:#94a3b8;font-weight:600;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px">
+          Raw Manifest <span style="font-weight:400;text-transform:none">(<span style="color:#34d399">■</span> audio &nbsp;<span style="color:#a78bfa">■</span> EXT-X-MAP &nbsp;<span style="color:#fb923c">■</span> key &nbsp;<span style="color:#60a5fa">■</span> variant)</span>
+        </div>
+        <pre>\${highlighted}</pre>
+      </div>
+    </div>
+  \`;
+}
+
+document.getElementById('url').addEventListener('keydown', e => { if(e.key==='Enter') analyze(); });
+</script>
+</body>
+</html>`);
+});
+
+router.get("/debug/manifest/analyze", async (req, res) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  const rawUrl = (req.query["url"] as string | undefined)?.trim();
+  if (!rawUrl) { res.status(400).json({ error: "Missing url param" }); return; }
+
+  let targetUrl: string;
+  try {
+    targetUrl = rawUrl;
+    new URL(targetUrl);
+  } catch {
+    res.status(400).json({ error: "Invalid URL" }); return;
+  }
+
+  let text: string;
+  try {
+    const r = await fetch(targetUrl, {
+      headers: { "User-Agent": "HLS-Manifest-Analyzer/1.0" },
+      signal: AbortSignal.timeout(20_000),
+      redirect: "follow",
+    });
+    if (!r.ok) { res.status(502).json({ error: `Upstream returned ${r.status}` }); return; }
+    text = await r.text();
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(502).json({ error: `Fetch failed: ${msg}` }); return;
+  }
+
+  const lines = text.split("\n");
+
+  const audioTracks: {
+    name: string; language: string; groupId: string;
+    default: boolean; forced: boolean; uri: string | null;
+  }[] = [];
+
+  let variantCount = 0;
+  let hasMap = false;
+
+  for (const line of lines) {
+    const t = line.trim();
+    if (t.startsWith("#EXT-X-MEDIA") && t.includes("TYPE=AUDIO")) {
+      const get = (k: string) => { const m = t.match(new RegExp(k + '="([^"]*)"')); return m ? m[1]! : ""; };
+      const getBool = (k: string) => t.includes(k + "=YES");
+      const uriMatch = t.match(/URI="([^"]+)"/);
+      audioTracks.push({
+        name: get("NAME"),
+        language: get("LANGUAGE"),
+        groupId: get("GROUP-ID"),
+        default: getBool("DEFAULT"),
+        forced: getBool("FORCED"),
+        uri: uriMatch ? uriMatch[1]! : null,
+      });
+    }
+    if (t.startsWith("#EXT-X-STREAM-INF")) variantCount++;
+    if (t.startsWith("#EXT-X-MAP") && t.includes('URI="')) hasMap = true;
+  }
+
+  res.json({ audioTracks, variantCount, hasMap, raw: text.slice(0, 32_000) });
+});
+
 export default router;
