@@ -216,8 +216,8 @@ function addonBaseUrl(req: Request): string {
   return `${proto}://${host}`;
 }
 
-/** Build upstream headers, optionally including session cookies */
-function buildUpstreamHeaders(referer: string, cookie?: string): Record<string, string> {
+/** Build upstream headers, optionally including session cookies and a Range header */
+function buildUpstreamHeaders(referer: string, cookie?: string, range?: string): Record<string, string> {
   const headers: Record<string, string> = {
     "User-Agent": UA,
     Referer: referer,
@@ -228,6 +228,12 @@ function buildUpstreamHeaders(referer: string, cookie?: string): Record<string, 
     Pragma: "no-cache",
   };
   if (cookie) headers["Cookie"] = cookie;
+  // Forward Range header when present so the CDN returns the correct byte window.
+  // All groovy.monster segment URLs are signed tokens for the same full video file
+  // (~33 MB); #EXT-X-BYTERANGE maps each 10-second segment to a byte range within
+  // that file.  Without forwarding Range the CDN returns the whole file from byte 0
+  // (= the intro) regardless of which segment is being requested.
+  if (range) headers["Range"] = range;
   return headers;
 }
 
@@ -338,6 +344,12 @@ raProxyRouter.get("/hls/seg", async (req: Request, res: Response) => {
   const ckEncoded = req.query["ck"] as string | undefined ?? "";
   const cookie = ckEncoded ? decodeCookie(decodeURIComponent(ckEncoded)) : undefined;
 
+  // Forward the client's Range header to the CDN.
+  // groovy.monster URLs are all tokens for the same ~33 MB full video file;
+  // only Range-forwarding lets the CDN return the correct byte window for each
+  // segment, enabling accurate playback and seeking on all platforms.
+  const clientRange = req.headers["range"] as string | undefined;
+
   // Detect whether this is a playlist or binary segment
   const lc = targetUrl.toLowerCase();
   const isPlaylist =
@@ -348,7 +360,7 @@ raProxyRouter.get("/hls/seg", async (req: Request, res: Response) => {
 
   try {
     const upstream = await axios.get(targetUrl, {
-      headers: buildUpstreamHeaders(referer, cookie),
+      headers: buildUpstreamHeaders(referer, cookie, clientRange),
       timeout: 30000,
       responseType: isPlaylist ? "text" : "stream",
       validateStatus: () => true,
@@ -383,42 +395,26 @@ raProxyRouter.get("/hls/seg", async (req: Request, res: Response) => {
       res.setHeader("Cache-Control", "no-cache, no-store");
       res.send(filtered);
     } else {
-      // Binary segment — stream through with correct Range / partial-content support.
+      // Binary segment — relay CDN response directly, including 206 Partial Content.
       //
-      // groovy.monster playlists use #EXT-X-BYTERANGE with *cumulative* byte offsets
-      // across independent chunk URLs.  When the player sees e.g.
-      //   #EXT-X-BYTERANGE:325428@270532   <chunk-2-url>
-      // it sends "Range: bytes=270532-595959" to our proxy.  We fetch the full chunk
-      // from the CDN (no Range header forwarded — the CDN serves each chunk from
-      // byte 0) and respond as 206 Partial Content claiming the range the player
-      // asked for.  This works because the chunk size always equals (end - start + 1)
-      // from the playlist — the data IS the right bytes for that range.
-      //
-      // This satisfies both:
-      //   • Initial playback  — player sends Range for segment 0  (@0)  → 206 ✓
-      //   • Seeking           — player sends Range for segment N  (@X)  → 206 ✓
-      //   • Android ExoPlayer — sends no Range or ignores 206 either way ✓
-      const clientRange = req.headers["range"] as string | undefined;
+      // All groovy.monster segment URLs are signed tokens for the *same* ~33 MB full
+      // video file.  #EXT-X-BYTERANGE maps each 10-second window to a byte range
+      // within that file.  We forward the client's Range header to the CDN (done above
+      // via buildUpstreamHeaders), so the CDN returns exactly the right bytes for each
+      // segment/seek position and responds with its own 206 + Content-Range.
+      // We relay those headers verbatim — no faking needed.
       const contentLen = upstream.headers["content-length"] as string | undefined;
+      const cdnContentRange = upstream.headers["content-range"] as string | undefined;
 
       res.setHeader("Accept-Ranges", "bytes");
       res.setHeader("Content-Type", contentType || "video/mp2t");
       res.setHeader("Cache-Control", "public, max-age=3600");
       if (contentLen) res.setHeader("Content-Length", contentLen);
+      if (cdnContentRange) res.setHeader("Content-Range", cdnContentRange);
 
-      if (clientRange && upstream.status === 200) {
-        // Player sent a Range request (driven by #EXT-X-BYTERANGE).
-        // Return 206 with a Content-Range that mirrors the requested range.
-        // The body is the full chunk from CDN which *is* the data for that range.
-        const m = /bytes=(\d+)-(\d+)/.exec(clientRange);
-        if (m) {
-          res.setHeader("Content-Range", `bytes ${m[1]}-${m[2]}/*`);
-          res.status(206);
-        }
-      } else if (upstream.headers["content-range"]) {
-        res.setHeader("Content-Range", upstream.headers["content-range"] as string);
-      }
-
+      // Relay the CDN status (200 or 206) so strict players (LG TV, HLS.js) see
+      // the correct partial-content response for Range requests.
+      res.status(upstream.status);
       (upstream.data as NodeJS.ReadableStream).pipe(res);
     }
   } catch (err) {
