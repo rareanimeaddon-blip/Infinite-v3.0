@@ -1328,6 +1328,14 @@ router.get("/m3u8", async (req: Request, res: Response) => {
     const refEnc = encodeURIComponent(effectiveReferer);
     const orgEnc = encodeURIComponent(effectiveOrigin);
 
+    // AnimeSalt CDN (as-cdn*.top) serves TS segments under fake extensions (.js,
+    // .css, .woff) with Content-Type: application/javascript.  Routing them
+    // through /seg.ts gives the proxy URL a literal .ts suffix so that both
+    // the player's URL-extension parser and segmentContentType() independently
+    // resolve to video/MP2T — isolating the fake-extension/MIME hypothesis.
+    const isAnimeSaltCdn = /^as-cdn\d*\.top$/i.test(parsed.hostname);
+    const segRoute = isAnimeSaltCdn ? "seg.ts" : "seg";
+
     const proxyUrl = (absUrl: string, isPlaylist: boolean): string => {
       if (isPlaylist) {
         return `${proxyBase}/m3u8?url=${encodeURIComponent(absUrl)}&referer=${refEnc}&origin=${orgEnc}`;
@@ -1341,7 +1349,7 @@ router.get("/m3u8", async (req: Request, res: Response) => {
           `&ref=${refEnc}&org=${orgEnc}`
         );
       }
-      return `${proxyBase}/seg?u=${encodeURIComponent(absUrl)}&ref=${refEnc}&org=${orgEnc}`;
+      return `${proxyBase}/${segRoute}?u=${encodeURIComponent(absUrl)}&ref=${refEnc}&org=${orgEnc}`;
     };
 
     // Detect whether the CDN returned a variant or master playlist.
@@ -1519,6 +1527,25 @@ function segmentContentType(targetUrl: string, cdnType: string | null): string {
   // to prevent direct hotlinking. Detect and override these fake content types.
   if (cdnType && cdnType.startsWith("image/")) return "video/MP2T";
 
+  // AnimeSalt CDN (as-cdn*.top) disguises MPEG-TS segments with fake browser-safe
+  // MIME types (application/javascript, text/css, font/woff*, etc.) to defeat
+  // hotlink-detection. LG WebOS's native HLS player strictly validates Content-Type
+  // and refuses to decode segments that are not video/MP2T — returning these fake
+  // types verbatim causes immediate playback failure on WebOS.
+  // Override any clearly-non-media CDN type to the correct value.
+  const FAKE_MEDIA_TYPES = [
+    "application/javascript",
+    "text/javascript",
+    "text/css",
+    "font/woff",
+    "font/woff2",
+    "application/font-woff",
+    "application/x-font-woff",
+    "text/plain",
+    "text/html",
+  ];
+  if (cdnType && FAKE_MEDIA_TYPES.some((t) => cdnType.startsWith(t))) return "video/MP2T";
+
   return cdnType ?? "video/MP2T";
 }
 
@@ -1640,6 +1667,29 @@ router.get("/as-seg", async (req: Request, res: Response) => {
 });
 
 router.options("/as-seg", (_req, res) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Headers", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.status(204).end();
+});
+
+// Segment proxy whose route path ends in ".ts" so that LG WebOS's native HLS
+// player sees a proper .ts URL extension in the playlist.  Some WebOS builds
+// check the URL path extension as a fallback when deciding whether to hand a
+// segment to the MPEG-TS demuxer; a .js / .css path can cause silent rejection
+// even if Content-Type is correct.  This route is identical to /seg in every
+// respect — segmentContentType() returns video/MP2T for both ".ts"-suffixed
+// URLs and fake non-media CDN types — but having both mechanisms removes any
+// ambiguity for strict players.
+router.get("/seg.ts", async (req: Request, res: Response) => {
+  const { u, ref, org } = req.query as Record<string, string | undefined>;
+  if (!u) { res.status(400).end(); return; }
+  let targetUrl: string;
+  try { targetUrl = decodeURIComponent(u); new URL(targetUrl); } catch { res.status(400).end(); return; }
+  await serveSegment(req, res, targetUrl, ref ? decodeURIComponent(ref) : undefined, org ? decodeURIComponent(org) : undefined);
+});
+
+router.options("/seg.ts", (_req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Headers", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
