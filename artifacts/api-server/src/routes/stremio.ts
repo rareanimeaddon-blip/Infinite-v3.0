@@ -1441,7 +1441,7 @@ async function resolveRAEpisodeStream(
     title: resolvedEp.title || `Episode ${episodeNum}`,
     name: "🌙 RareAnime [HLS]",
     behaviorHints: {
-      notWebReady: false,
+      notWebReady: true,
       bingeGroup: `rareanime-${raSlugFromUrl(pageUrl)}`,
     },
   };
