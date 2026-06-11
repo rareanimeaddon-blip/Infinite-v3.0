@@ -24,9 +24,18 @@ export async function extractHubCloud(
       const html = await getHtml(url);
       const $ = cheerio.load(html);
       const rawHref = $("#download").attr("href") ?? "";
-      href = rawHref.startsWith("http")
-        ? rawHref
-        : `${baseUrl.replace(/\/+$/, "")}/${rawHref.replace(/^\/+/, "")}`;
+      if (rawHref) {
+        href = rawHref.startsWith("http")
+          ? rawHref
+          : `${baseUrl.replace(/\/+$/, "")}/${rawHref.replace(/^\/+/, "")}`;
+      } else {
+        // Fallback: some HubCloud pages store the download URL in a JS variable
+        const varMatch = /var\s+url\s*=\s*['"]([^'"]+)['"]/.exec(html);
+        href = varMatch?.[1] ?? "";
+        if (href && !href.startsWith("http")) {
+          href = `${baseUrl.replace(/\/+$/, "")}/${href.replace(/^\/+/, "")}`;
+        }
+      }
     }
 
     if (!href) {
@@ -133,6 +142,28 @@ export async function extractHubCloud(
         });
       } else if (text.includes("buzzserver") || text.includes("buzz server") || text.includes("buzz")) {
         buzzPromises.push(extractBuzzServer(link, srcName, labelExtras, quality, streams));
+      } else if (text.includes("10gbps") || link.includes("hubcloud.cx")) {
+        // 10Gbps server: may need to follow a redirect to extract the link= param
+        buzzPromises.push(extract10Gbps(link, srcName, labelExtras, bucketHeaders, streams));
+      } else if (text.includes("zipdisk") || link.includes("workers.dev")) {
+        streams.push({
+          name: `${srcName} [ZipDisk]`,
+          title: `ZipDisk ${labelExtras}`,
+          url: link,
+          type: "mp4",
+          headers: bucketHeaders,
+          behaviorHints: { notWebReady: false },
+        });
+      } else if (link.includes("r2.dev")) {
+        // R2 direct link — only serve if piped through our proxy (private buckets need this)
+        streams.push({
+          name: `${srcName} [Direct R2]`,
+          title: `Direct ${labelExtras}`,
+          url: link,
+          type: "mp4",
+          headers: bucketHeaders,
+          behaviorHints: { notWebReady: false },
+        });
       } else if (text.includes("v-cloud") || text.includes("vcloud") || text.includes("v cloud")) {
         streams.push({
           name: `${srcName} [V-Cloud]`,
@@ -210,5 +241,37 @@ async function extractBuzzServer(
     }
   } catch (e) {
     logger.error({ err: e }, "HubCloud BuzzServer: error");
+  }
+}
+
+async function extract10Gbps(
+  link: string,
+  srcName: string,
+  labelExtras: string,
+  headers: Record<string, string>,
+  streams: Stream[],
+) {
+  try {
+    let finalUrl = link;
+    if (!link.includes("hubcloud.cx")) {
+      // Follow redirect to extract the link= query param
+      const resp = await getNoRedirect(link);
+      const loc = resp.headers["location"] ?? "";
+      if (loc.includes("link=")) {
+        finalUrl = loc.substring(loc.indexOf("link=") + 5);
+      } else if (loc) {
+        finalUrl = loc;
+      }
+    }
+    streams.push({
+      name: `${srcName} [10Gbps]`,
+      title: `10Gbps ${labelExtras}`,
+      url: finalUrl,
+      type: "mp4",
+      headers,
+      behaviorHints: { notWebReady: false },
+    });
+  } catch (e) {
+    logger.error({ err: e }, "HubCloud 10Gbps: error");
   }
 }

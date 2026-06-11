@@ -2,7 +2,6 @@ import * as cheerio from "cheerio";
 import { getHtml, getJson, BROWSER_HEADERS } from "../utils/request.js";
 import {
   cleanTitle,
-  getRedirectLinks,
   getSearchQuality,
   encodeId,
   decodeId,
@@ -19,9 +18,95 @@ import {
 const TMDB_API_KEY = process.env["TMDB_API_KEY"] ?? "5f39fd16e987a9e3fce30d55cf09b438";
 const TMDB_BASE = "https://image.tmdb.org/t/p/original";
 const TMDB_API = "https://api.themoviedb.org/3";
-const SEARCH_URL = "https://search.hdhub4u.glass";
+// pingora.fyi is the current live Typesense endpoint (hdhub4u.glass is the old domain)
+const SEARCH_URL = "https://search.pingora.fyi";
+const SEARCH_URL_FALLBACK = "https://search.hdhub4u.glass";
 const DOMAINS_URL =
   "https://raw.githubusercontent.com/phisher98/TVVVV/refs/heads/main/domains.json";
+
+// Cookie required by HDHub4U to show download links
+const HD_COOKIE = "xla=s4t";
+
+// Redirect-wrapper domains: these pages embed the real CDN URL in obfuscated JS.
+// They need fetchRedirectLink() to decode before extractStreams() can handle them.
+const REDIRECT_WRAPPERS =
+  /techyboy4u|gadgetsweb|cryptoinsights|bloggingvector|ampproject\.org/i;
+
+function rot13(str: string): string {
+  return str.replace(/[a-zA-Z]/g, (c) => {
+    const code = c.charCodeAt(0);
+    const base = code <= 90 ? 65 : 97;
+    return String.fromCharCode(((code - base + 13) % 26) + base);
+  });
+}
+
+function b64d(str: string): string {
+  return Buffer.from(str.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8");
+}
+
+/**
+ * Fetches a redirect-wrapper page and decodes the embedded multi-layer
+ * obfuscated URL to get the real CDN/HubCloud link.
+ *
+ * Reference algorithm:
+ *   s('o', '<encoded>') or ck('_wp_http_N', '<encoded>')
+ *   → atob(rot13(atob(atob(encoded)))) → JSON → atob(json.o)
+ */
+async function fetchRedirectLink(url: string, depth = 0): Promise<string | null> {
+  if (depth > 3) return null;
+  try {
+    const res = await fetch(url, {
+      headers: {
+        ...BROWSER_HEADERS,
+        "Cookie": HD_COOKIE,
+        "Referer": url,
+      },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) return null;
+    const html = await res.text();
+
+    // Find obfuscated encoded payload
+    const pattern =
+      /s\s*\(\s*['"]o['"]\s*,\s*['"]([A-Za-z0-9+/=]+)['"]|ck\s*\(\s*['"]_wp_http_\d+['"]\s*,\s*['"]([^'"]+)['"]/g;
+    let encoded = "";
+    let m: RegExpExecArray | null;
+    while ((m = pattern.exec(html)) !== null) {
+      encoded += m[1] ?? m[2] ?? "";
+    }
+
+    if (encoded) {
+      try {
+        const decoded = b64d(rot13(b64d(b64d(encoded))));
+        const json = JSON.parse(decoded) as { o?: string; data?: string; blog_url?: string };
+        const oUrl = json.o ? b64d(json.o).trim() : "";
+        if (oUrl) return oUrl;
+        const data = json.data ? b64d(json.data).trim() : "";
+        const blogUrl = (json.blog_url ?? "").trim();
+        if (blogUrl && data) {
+          const res2 = await fetch(`${blogUrl}?re=${data}`, {
+            headers: { ...BROWSER_HEADERS, "Cookie": HD_COOKIE },
+            signal: AbortSignal.timeout(8_000),
+          });
+          const text = (await res2.text()).trim();
+          if (text) return text;
+        }
+      } catch {
+        // decode failed — fall through to other strategies
+      }
+    }
+
+    // Fallback: window.location.href redirect
+    const locMatch = /window\.location\.href\s*=\s*['"]([^'"]+)['"]/.exec(html);
+    if (locMatch?.[1] && locMatch[1] !== url && !locMatch[1].includes(url)) {
+      return fetchRedirectLink(locMatch[1], depth + 1);
+    }
+
+    return null;
+  } catch {
+    return null;
+  }
+}
 
 export let MAIN_URL =
   process.env["HDHUB4U_URL"] ?? "https://new1.hdhub4u.limo";
@@ -274,7 +359,7 @@ export async function getHomepage(
   const url = `${base}page/${page}/`;
   logger.info({ url }, "HDHub4U: fetching homepage");
   try {
-    const html = await getHtml(url, BROWSER_HEADERS);
+    const html = await getHtml(url, { "Cookie": HD_COOKIE, "Referer": `${MAIN_URL}/` });
     const $ = cheerio.load(html);
     const items: CatalogItem[] = [];
 
@@ -328,12 +413,9 @@ function toAbsoluteUrl(url: string): string {
   return MAIN_URL.replace(/\/$/, "") + (url.startsWith("/") ? url : "/" + url);
 }
 
-export async function searchContent(
-  query: string,
-  page: number,
-): Promise<CatalogItem[]> {
-  const url =
-    `${SEARCH_URL}/collections/post/documents/search` +
+function buildSearchUrl(base: string, query: string, page: number): string {
+  return (
+    `${base}/collections/post/documents/search` +
     `?q=${encodeURIComponent(query)}` +
     `&query_by=post_title,category` +
     `&query_by_weights=4,2` +
@@ -341,31 +423,51 @@ export async function searchContent(
     `&limit=15` +
     `&highlight_fields=none` +
     `&use_cache=true` +
-    `&page=${page}`;
+    `&page=${page}`
+  );
+}
 
+export async function searchContent(
+  query: string,
+  page: number,
+): Promise<CatalogItem[]> {
   logger.info({ query, page }, "HDHub4U: searching");
-  try {
-    const data = await getJson<SearchResponse>(url, BROWSER_HEADERS);
-    return (data.hits ?? []).map((hit) => {
-      const permalink = toAbsoluteUrl(hit.document.permalink);
-      return {
-        id: itemIdFromUrl(permalink),
-        type: "movie" as const,
-        name: hit.document.post_title,
-        poster: hit.document.post_thumbnail,
-      };
-    });
-  } catch (e) {
-    logger.error({ err: e, query }, "HDHub4U: search error");
-    return [];
+
+  async function trySearch(base: string): Promise<CatalogItem[] | null> {
+    try {
+      const data = await getJson<SearchResponse>(buildSearchUrl(base, query, page), BROWSER_HEADERS, 8000);
+      const hits = data.hits ?? [];
+      if (hits.length === 0 && base === SEARCH_URL) return null; // try fallback
+      return hits.map((hit) => {
+        const permalink = toAbsoluteUrl(hit.document.permalink);
+        return {
+          id: itemIdFromUrl(permalink),
+          type: "movie" as const,
+          name: hit.document.post_title,
+          poster: hit.document.post_thumbnail,
+        };
+      });
+    } catch {
+      return null;
+    }
   }
+
+  const primary = await trySearch(SEARCH_URL);
+  if (primary !== null) return primary;
+
+  // Fallback to old domain
+  const fallback = await trySearch(SEARCH_URL_FALLBACK);
+  if (fallback !== null) return fallback;
+
+  logger.warn({ query }, "HDHub4U: both search endpoints failed");
+  return [];
 }
 
 export async function getMeta(pageUrl: string): Promise<MetaItem | null> {
   const absoluteUrl = toAbsoluteUrl(pageUrl);
   logger.info({ pageUrl: absoluteUrl }, "HDHub4U: fetching meta");
   try {
-    const html = await getHtml(absoluteUrl, BROWSER_HEADERS);
+    const html = await getHtml(absoluteUrl, { "Cookie": HD_COOKIE, "Referer": `${MAIN_URL}/` });
     const $ = cheerio.load(html);
 
     let title = $(
@@ -715,7 +817,7 @@ export async function findByMeta(
 }
 
 const STREAM_DOMAINS =
-  /hubcdn|hubdrive|hubcloud|hblinks|hdstream4u|hubstream|pixeldrain|streamtape|gadgetsweb|hbstream/i;
+  /hubcdn|hubdrive|hubcloud|hblinks|hdstream4u|hubstream|pixeldrain|streamtape|gadgetsweb|hbstream|techyboy4u|cryptoinsights|bloggingvector/i;
 const QUALITY_TEXT = /480p?|720p?|1080p?|2160p?|4[Kk]|WATCH|STREAM/i;
 // Skip same-domain links (hdhub4u.*) — they are movie-page links, not stream hosts.
 // A "WATCH" button pointing back to hdhub4u.cl is not a downloadable stream.
@@ -794,10 +896,14 @@ export async function getStreams(
   const tasks = links.map(async (link) => {
     try {
       let finalLink = link;
-      if (link.includes("?id=")) {
-        const redirected = getRedirectLinks(link, link) as string | string[];
-        finalLink = Array.isArray(redirected) ? (redirected[0] ?? link) : redirected;
-        logger.info({ link, finalLink }, "HDHub4U: redirect resolved");
+      // Redirect-wrapper domains (techyboy4u, gadgetsweb, ?id= links, etc.) embed
+      // the real CDN/HubCloud URL in multi-layer obfuscated JS. Decode first.
+      if (link.includes("?id=") || REDIRECT_WRAPPERS.test(link)) {
+        const resolved = await fetchRedirectLink(link);
+        if (resolved && resolved !== link) {
+          logger.info({ link, resolved }, "HDHub4U: redirect resolved");
+          finalLink = resolved;
+        }
       }
       return await extractStreams(finalLink);
     } catch (e) {
