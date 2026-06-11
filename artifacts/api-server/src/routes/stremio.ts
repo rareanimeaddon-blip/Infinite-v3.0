@@ -581,7 +581,11 @@ function hd4uStreamToStremio(s: Stream, req?: Request): Record<string, unknown> 
     const base = apiBase(req);
     let origin = referer;
     try { origin = new URL(referer).origin; } catch {}
-    const proxiedUrl = `${base}/proxy?u=${encodeParam(s.url)}&ref=${encodeParam(referer)}&ori=${encodeParam(origin)}`;
+    // Include the stable HubCloud landing page URL (lp) when available so the
+    // proxy can re-run full 2-step extraction on token expiry instead of just
+    // re-fetching the short-lived download-page URL stored in ref.
+    const lpParam = s.reExtractUrl ? `&lp=${encodeParam(s.reExtractUrl)}` : "";
+    const proxiedUrl = `${base}/proxy?u=${encodeParam(s.url)}&ref=${encodeParam(referer)}&ori=${encodeParam(origin)}${lpParam}`;
     return {
       name: s.name,
       title: s.title,
@@ -607,7 +611,8 @@ function fourkdStreamToStremio(s: import("../providers/fourkdhub.js").FourkdStre
     const base = apiBase(req);
     let origin = referer;
     try { origin = new URL(referer).origin; } catch {}
-    const proxiedUrl = `${base}/proxy?u=${encodeParam(s.url)}&ref=${encodeParam(referer)}&ori=${encodeParam(origin)}`;
+    const lpParam = s.reExtractUrl ? `&lp=${encodeParam(s.reExtractUrl)}` : "";
+    const proxiedUrl = `${base}/proxy?u=${encodeParam(s.url)}&ref=${encodeParam(referer)}&ori=${encodeParam(origin)}${lpParam}`;
     return {
       name: s.name,
       title: s.title,

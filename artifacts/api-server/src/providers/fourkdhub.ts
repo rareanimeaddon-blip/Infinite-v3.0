@@ -275,6 +275,8 @@ export interface FourkdStream {
   title: string;
   url: string;
   headers?: Record<string, string>;
+  /** HubCloud landing page URL — forwarded to the proxy for token refresh */
+  reExtractUrl?: string;
   behaviorHints: { bingeGroup: string; notWebReady: boolean };
 }
 
@@ -327,6 +329,7 @@ export async function getFourkdHubStreams(
               title: titleLines,
               url: s.url,
               headers: s.headers,
+              reExtractUrl: s.reExtractUrl,
               behaviorHints: { bingeGroup: `4khdhub-hc`, notWebReady: false },
             });
           }
@@ -348,6 +351,7 @@ export async function getFourkdHubStreams(
                   name: `${nameBadge}\n${s.name}`,
                   title: titleLines,
                   url: s.url,
+                  reExtractUrl: s.reExtractUrl,
                   behaviorHints: { bingeGroup: `4khdhub-hd`, notWebReady: false },
                 });
               }

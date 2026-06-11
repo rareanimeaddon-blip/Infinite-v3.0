@@ -142,6 +142,16 @@ export async function extractHubCloud(
       await Promise.allSettled(buzzPromises);
     }
 
+    // Stamp every extracted stream with the landing page URL so the proxy can
+    // re-run full 2-step extraction (landing → download page → fresh CDN URL)
+    // when the short-lived R2/S3 token has expired at playback time.
+    // Only applies when url is the stable landing page (no "hubcloud.php" token).
+    if (!url.includes("hubcloud.php")) {
+      for (const s of streams) {
+        s.reExtractUrl = url;
+      }
+    }
+
     logger.info({ count: streams.length }, `${TAG}: extraction complete`);
   } catch (e) {
     logger.error({ err: e, url }, `${TAG}: error`);
