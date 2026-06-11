@@ -59,6 +59,8 @@ export async function extractHubCloud(
       .filter(Boolean)
       .join(" ");
 
+    const buzzPromises: Promise<void>[] = [];
+
     $d("a.btn").each((_, el) => {
       const link = $d(el).attr("href") ?? "";
       const text = $d(el).text().toLowerCase();
@@ -130,11 +132,15 @@ export async function extractHubCloud(
           behaviorHints: { notWebReady: false },
         });
       } else if (text.includes("buzzserver")) {
-        void extractBuzzServer(link, srcName, labelExtras, quality, streams);
+        buzzPromises.push(extractBuzzServer(link, srcName, labelExtras, quality, streams));
       } else {
         logger.debug({ text, link }, `${TAG}: unknown button type`);
       }
     });
+
+    if (buzzPromises.length > 0) {
+      await Promise.allSettled(buzzPromises);
+    }
 
     logger.info({ count: streams.length }, `${TAG}: extraction complete`);
   } catch (e) {

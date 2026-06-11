@@ -51,12 +51,37 @@ async function fetchWithRedirects(
   throw new Error("fetchWithRedirects: too many redirects");
 }
 
+/**
+ * Re-fetch the HubCloud download page and extract a fresh signed CDN URL.
+ * Used as a reactive fallback when the CDN returns 403/404 for the stored URL.
+ * Matches both FSL/R2-style (?token=<epoch>) and S3/B2-style (?Expires=<epoch>).
+ */
+async function refreshFromDownloadPage(downloadPageUrl: string): Promise<string | null> {
+  try {
+    const pageRes = await fetch(downloadPageUrl, {
+      headers: { "User-Agent": UPSTREAM_UA },
+      signal: AbortSignal.timeout(10_000),
+      redirect: "follow",
+    });
+    if (!pageRes.ok) return null;
+    const html = await pageRes.text();
+    const match = /href="(https?:\/\/[^"]{10,}[?&](?:amp;)?(?:token|Expires)=\d{8,12}[^"]*)"/i.exec(html);
+    if (match?.[1]) {
+      return match[1].replace(/&amp;/gi, "&");
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 async function pipeUpstream(
   targetUrl: string,
   cookie: string | undefined,
   req: Request,
   res: Response,
   extraHeaders?: Record<string, string>,
+  onError?: (status: number) => Promise<string | null>,
 ): Promise<void> {
   const t0 = Date.now();
 
@@ -112,6 +137,15 @@ async function pipeUpstream(
   }
 
   if (upstream.status >= 400) {
+    // Give the caller a chance to supply a fresh URL (e.g. re-extracted from
+    // the HubCloud download page) before we commit the error to the client.
+    if (onError) {
+      const freshUrl = await onError(upstream.status).catch(() => null);
+      if (freshUrl) {
+        logger.info({ freshUrl: freshUrl.slice(0, 100), originalStatus: upstream.status }, "Proxy: retrying with refreshed URL");
+        return pipeUpstream(freshUrl, cookie, req, res, extraHeaders);
+      }
+    }
     logger.warn({ targetUrl, status: upstream.status }, "Upstream error");
     logDebug({
       method: req.method,
@@ -773,19 +807,19 @@ router.get("/proxy", async (req, res) => {
   const isMpd = targetUrl.includes(".mpd") || targetUrl.includes("manifest");
 
   if (!isMpd) {
-    // ── R2 signed-URL auto-refresh ────────────────────────────────────────────
+    // ── R2 signed-URL proactive refresh ──────────────────────────────────────
     // HubCloud (used by HDHub4U / 4KHDHub) serves video files from Cloudflare
-    // R2 with a Unix-timestamp token (?token=<epoch>) that expires in ~5-10
-    // minutes.  By the time Stremio shows the stream list and the user taps to
-    // play, the token is usually dead → CDN returns 403.
+    // R2 (?token=<epoch>) or S3/B2 (?Expires=<epoch>) with short-lived tokens.
+    // By the time Stremio shows the stream list and the user taps to play, the
+    // token is usually dead → CDN returns 403.
     //
     // The HubCloud *download page* URL (stored in our `ref` param) has a much
-    // longer-lived token; re-fetching it yields a fresh R2 signed URL.
+    // longer-lived token; re-fetching it yields a fresh signed URL.
     // Only activate when:
-    //   • the target URL carries a 9-11 digit numeric token (Unix timestamp), AND
+    //   • the target URL carries a 9-11 digit numeric token, AND
     //   • the token has expired or is within 60 s of expiry, AND
     //   • we have the download-page URL in the referer param.
-    const r2TokenMatch = /[?&]token=(\d{9,11})(?:[&#]|$)/.exec(targetUrl);
+    const r2TokenMatch = /[?&](?:token|Expires)=(\d{9,11})(?:[&#]|$)/.exec(targetUrl);
     if (r2TokenMatch && extraHeaders?.referer) {
       const tokenTs = parseInt(r2TokenMatch[1]!);
       const nowTs   = Math.floor(Date.now() / 1000);
@@ -798,26 +832,39 @@ router.get("/proxy", async (req, res) => {
           });
           if (pageRes.ok) {
             const html = await pageRes.text();
-            // Match any href that carries a fresh numeric token
-            const freshMatch = /href="(https?:\/\/[^"]{10,}[?&](?:amp;)?token=\d{9,11}[^"]*)"/i.exec(html);
+            // Match FSL/R2 (token=) or S3/B2 (Expires=) signed URLs
+            const freshMatch = /href="(https?:\/\/[^"]{10,}[?&](?:amp;)?(?:token|Expires)=\d{8,12}[^"]*)"/i.exec(html);
             if (freshMatch?.[1]) {
               // HTML-unescape &amp; entities that browsers encode in href attributes
               const freshUrl = freshMatch[1].replace(/&amp;/gi, "&");
               logger.info(
                 { oldExpiry: tokenTs, newUrl: freshUrl.slice(0, 100) },
-                "Proxy: refreshed expired R2 token via HubCloud download page",
+                "Proxy: proactively refreshed expired signed URL via HubCloud download page",
               );
               targetUrl = freshUrl;
             }
           }
         } catch (err) {
-          logger.warn({ err }, "Proxy: R2 token refresh failed — falling back to original URL");
+          logger.warn({ err }, "Proxy: proactive refresh failed — will retry reactively on 403");
         }
       }
     }
 
+    // ── Reactive retry on 403/404 ─────────────────────────────────────────────
+    // When the CDN returns 403 or 404 (e.g. expired token that wasn't caught
+    // proactively, or intermediate HubCloud redirect URL with no token in its
+    // query string), re-fetch the HubCloud download page and try a fresh URL.
+    // This is a no-op for non-HubCloud streams (no ref param present).
+    const onError = extraHeaders?.referer
+      ? async (status: number): Promise<string | null> => {
+          if (status !== 403 && status !== 404) return null;
+          logger.info({ status, referer: extraHeaders.referer!.slice(0, 80) }, "Proxy: reactive refresh triggered");
+          return refreshFromDownloadPage(extraHeaders.referer!);
+        }
+      : undefined;
+
     try {
-      await pipeUpstream(targetUrl, cookie, req, res, extraHeaders);
+      await pipeUpstream(targetUrl, cookie, req, res, extraHeaders, onError);
     } catch (err) {
       logger.error({ err, targetUrl }, "Proxy error");
       if (!res.headersSent) res.status(502).end();
