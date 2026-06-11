@@ -105,7 +105,13 @@ async function reExtractFromHubCloud(landingPageUrl: string): Promise<string | n
       }
     }
 
-    // Step 2 — fetch the download page and extract the first signed CDN URL
+    // Step 2 — fetch the download page and extract a signed CDN URL.
+    // Prefer hub.*.buzz CDN URLs over Cloudflare R2 (pub-*.r2.dev):
+    //   • buzz CDNs accept tokens that are many minutes old — long grace period,
+    //     works reliably when piped through the proxy.
+    //   • R2 has sub-second token precision; some R2 buckets are also private
+    //     ("bucket not viewable"), causing 403 even with a valid redirect.
+    // If no buzz URL is present, fall back to the first available signed URL.
     const dlRes = await fetch(downloadPageUrl, {
       headers: { "User-Agent": UPSTREAM_UA, "Referer": landingPageUrl },
       signal: AbortSignal.timeout(12_000),
@@ -116,9 +122,13 @@ async function reExtractFromHubCloud(landingPageUrl: string): Promise<string | n
       return null;
     }
     const dlHtml = await dlRes.text();
-    const urlMatch = /href="(https?:\/\/[^"]{10,}[?&](?:amp;)?(?:token|Expires)=\d{8,12}[^"]*)"/i.exec(dlHtml);
-    if (urlMatch?.[1]) {
-      return urlMatch[1].replace(/&amp;/gi, "&");
+    const signedUrls = [...dlHtml.matchAll(/href="(https?:\/\/[^"]{10,}[?&](?:amp;)?(?:token|Expires)=\d{8,12}[^"]*)"/gi)]
+      .map(m => m[1]!.replace(/&amp;/gi, "&"));
+    if (signedUrls.length > 0) {
+      const buzzUrl = signedUrls.find(u => /hub\.[^.]+\.buzz\//i.test(u));
+      const chosen = buzzUrl ?? signedUrls[0]!;
+      logger.info({ chosen: chosen.slice(0, 80), total: signedUrls.length, preferredBuzz: !!buzzUrl }, "Proxy: picked CDN URL from download page");
+      return chosen;
     }
     logger.warn({ url: downloadPageUrl.slice(0, 80) }, "Proxy: no signed CDN URL found on HubCloud download page");
     return null;
@@ -137,9 +147,14 @@ async function refreshFromDownloadPage(downloadPageUrl: string): Promise<string 
     });
     if (!pageRes.ok) return null;
     const html = await pageRes.text();
-    const match = /href="(https?:\/\/[^"]{10,}[?&](?:amp;)?(?:token|Expires)=\d{8,12}[^"]*)"/i.exec(html);
-    if (match?.[1]) {
-      return match[1].replace(/&amp;/gi, "&");
+    const signedUrls = [...html.matchAll(/href="(https?:\/\/[^"]{10,}[?&](?:amp;)?(?:token|Expires)=\d{8,12}[^"]*)"/gi)]
+      .map(m => m[1]!.replace(/&amp;/gi, "&"));
+    if (signedUrls.length > 0) {
+      // Prefer hub.*.buzz over R2 — buzz CDNs have long token grace periods
+      // and work reliably when piped; R2 has sub-second precision and can have
+      // private buckets ("bucket not viewable" 403).
+      const buzzUrl = signedUrls.find(u => /hub\.[^.]+\.buzz\//i.test(u));
+      return buzzUrl ?? signedUrls[0]!;
     }
     return null;
   } catch {
