@@ -1,3 +1,5 @@
 - [RareAnime LG TV ABR fix](rareanime-lg-tv-abr.md) — LG WebOS "Error while decoding" after ~5s is caused by MPEG-TS ABR switching; fix is filterToSingleVariant() in rareanime-proxy.ts.
 - [AnimeSalt CDN VOD tag injection](animesalt-vod-tags.md) — CDN already sends #EXT-X-ENDLIST but omits #EXT-X-PLAYLIST-TYPE:VOD; inject before the rewriting loop, not after.
 - [AnimeSalt LG TV video freeze fix](animesalt-lg-tv-freeze.md) — muxed video TS + external AUDIO= group causes LG WebOS video renderer to freeze; fix is to strip CDN audio renditions from outer master.
+- [HubCloud BuzzServer HTML-body change](hubcloud-buzzserver-html.md) — BuzzServer /download now returns 200 HTML instead of redirect; must read body and extract id="download" href for the CDN URL.
+- [HubCloud R2 private bucket strategy](hubcloud-r2-strategy.md) — Plain pub-*.r2.dev URLs: proxy tries re-extraction (BuzzServer→10Gbps→ZipDisk), then 302 redirect to R2 (player's IP bypasses server-side block). extract10Gbps must not push original link on redirect failure.

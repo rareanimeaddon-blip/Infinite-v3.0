@@ -1,5 +1,5 @@
 import * as cheerio from "cheerio";
-import { getHtml, getNoRedirect } from "../utils/request.js";
+import { getHtml, getNoRedirect, BROWSER_HEADERS } from "../utils/request.js";
 import { getBaseUrl, getIndexQuality, cleanTitle } from "../utils/index.js";
 import { logger } from "../lib/logger.js";
 import type { Stream } from "./types.js";
@@ -229,10 +229,31 @@ async function extractBuzzServer(
   streams: Stream[],
 ) {
   try {
-    const resp = await getNoRedirect(`${link}/download`);
-    const dlink =
-      resp.headers["hx-redirect"] ?? resp.headers["location"] ?? "";
-    if (dlink) {
+    // Use fetch directly (not getNoRedirect) so we can read the body when
+    // BuzzServer returns 200 HTML instead of a redirect header.
+    const resp = await fetch(`${link}/download`, {
+      headers: BROWSER_HEADERS,
+      redirect: "manual",
+      signal: AbortSignal.timeout(12_000),
+    });
+
+    // Old BuzzServer behaviour: sends hx-redirect or location header.
+    let dlink = resp.headers.get("hx-redirect") || resp.headers.get("location") || "";
+
+    // New BuzzServer behaviour (2025-06+): returns 200 HTML with a
+    // "Link Generated! Download Here" page.  The CDN URL is in id="download".
+    if (!dlink && resp.status === 200) {
+      const html = await resp.text();
+      const m =
+        /id="download"[^>]*\shref="([^"]+)"/i.exec(html) ||
+        /href="([^"]+)"[^>]*\sid="download"/i.exec(html);
+      if (m?.[1]) {
+        dlink = m[1].replace(/&amp;/gi, "&");
+        logger.info({ dlink: dlink.slice(0, 80) }, "HubCloud BuzzServer: extracted CDN URL from HTML page");
+      }
+    }
+
+    if (dlink && dlink.startsWith("http")) {
       streams.push({
         name: `${srcName} [BuzzServer]`,
         title: `BuzzServer ${labelExtras}`,
@@ -241,7 +262,7 @@ async function extractBuzzServer(
         behaviorHints: { notWebReady: false },
       });
     } else {
-      logger.warn({}, "HubCloud BuzzServer: no redirect found");
+      logger.warn({ status: resp.status }, "HubCloud BuzzServer: no CDN URL found");
     }
   } catch (e) {
     logger.error({ err: e }, "HubCloud BuzzServer: error");
@@ -256,16 +277,23 @@ async function extract10Gbps(
   streams: Stream[],
 ) {
   try {
-    let finalUrl = link;
-    if (!link.includes("hubcloud.cx")) {
+    let finalUrl = "";
+    if (link.includes("hubcloud.cx")) {
+      finalUrl = link;
+    } else {
       // Follow redirect to extract the link= query param
       const resp = await getNoRedirect(link);
       const loc = resp.headers["location"] ?? "";
       if (loc.includes("link=")) {
         finalUrl = loc.substring(loc.indexOf("link=") + 5);
-      } else if (loc) {
+      } else if (loc && loc.startsWith("http")) {
         finalUrl = loc;
       }
+      // If no redirect found, finalUrl stays empty — don't push an HTML page as stream
+    }
+    if (!finalUrl) {
+      logger.warn({ link }, "HubCloud 10Gbps: no CDN URL found — skipping");
+      return;
     }
     streams.push({
       name: `${srcName} [10Gbps]`,

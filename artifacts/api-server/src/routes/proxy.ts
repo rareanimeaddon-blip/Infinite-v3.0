@@ -129,8 +129,10 @@ async function reExtractFromHubCloud(landingPageUrl: string): Promise<string | n
     const dlHtml = await dlRes.text();
 
     // Priority 1 — BuzzServer: find any <a> whose visible text contains "buzz"
-    // and call its /download endpoint.  BuzzServer redirects to a hub.*.buzz
-    // CDN URL that is stable and has a long token grace period (unlike R2).
+    // and call its /download endpoint.
+    // Old behaviour: BuzzServer responds with hx-redirect / location → CDN URL.
+    // New behaviour (2025-06+): BuzzServer returns 200 HTML "Link Generated!"
+    //   page — the CDN URL is in id="download" href inside that HTML body.
     const allAnchors = [...dlHtml.matchAll(/<a\b[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi)];
     for (const [, rawHref, innerHtml] of allAnchors) {
       if (!rawHref) continue;
@@ -142,12 +144,29 @@ async function reExtractFromHubCloud(landingPageUrl: string): Promise<string | n
         const buzzRes = await fetch(`${buzzLink}/download`, {
           headers: { "User-Agent": UPSTREAM_UA, "Referer": downloadPageUrl },
           redirect: "manual",
-          signal: AbortSignal.timeout(8_000),
+          signal: AbortSignal.timeout(12_000),
         });
+
+        // Old path: redirect header
         const loc = buzzRes.headers.get("hx-redirect") || buzzRes.headers.get("location") || "";
-        if (loc) {
-          logger.info({ loc: loc.slice(0, 100) }, "Proxy: BuzzServer re-extraction → fresh buzz CDN URL");
+        if (loc && loc.startsWith("http")) {
+          logger.info({ loc: loc.slice(0, 100) }, "Proxy: BuzzServer re-extraction → redirect CDN URL");
           return loc;
+        }
+
+        // New path: 200 HTML body — extract id="download" href
+        if (buzzRes.status === 200) {
+          const html = await buzzRes.text();
+          const m =
+            /id="download"[^>]*\shref="([^"]+)"/i.exec(html) ||
+            /href="([^"]+)"[^>]*\sid="download"/i.exec(html);
+          if (m?.[1]) {
+            const cdnUrl = m[1].replace(/&amp;/gi, "&");
+            if (cdnUrl.startsWith("http")) {
+              logger.info({ cdnUrl: cdnUrl.slice(0, 100) }, "Proxy: BuzzServer re-extraction → CDN URL from HTML page");
+              return cdnUrl;
+            }
+          }
         }
       } catch (e) {
         logger.warn({ err: e }, "Proxy: BuzzServer re-extraction failed");
