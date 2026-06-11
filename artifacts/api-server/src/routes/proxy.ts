@@ -43,7 +43,7 @@ async function fetchWithRedirects(
     const res = await fetch(currentUrl, {
       headers,
       redirect: "manual",
-      signal: AbortSignal.timeout(30_000),
+      signal: AbortSignal.timeout(60_000),
     });
     const status = res.status;
     if (status === 301 || status === 302 || status === 303 || status === 307 || status === 308) {
@@ -374,6 +374,11 @@ async function pipeUpstream(
     "user-agent": UPSTREAM_UA,
     referer: "https://api3.aoneroom.com",
     origin: "https://api3.aoneroom.com",
+    // Force identity encoding so the upstream Content-Length matches the raw
+    // byte count we pipe to the client.  Without this, Node's fetch may
+    // auto-decompress gzip/brotli responses but still forward the CDN's
+    // compressed Content-Length, causing ExoPlayer seek failures.
+    "accept-encoding": "identity",
   };
   if (extraHeaders) {
     for (const [k, v] of Object.entries(extraHeaders)) {
@@ -399,7 +404,7 @@ async function pipeUpstream(
     : () => fetch(targetUrl, {
         headers: upstreamHeaders,
         redirect: "follow",
-        signal: AbortSignal.timeout(30_000),
+        signal: AbortSignal.timeout(60_000),
       });
 
   let upstream: globalThis.Response;
@@ -449,7 +454,9 @@ async function pipeUpstream(
     return;
   }
 
-  const contentType = upstream.headers.get("content-type") ?? "application/octet-stream";
+  // Prefer the upstream content-type; fall back to video/mp4 so ExoPlayer
+  // recognises the stream as video (application/octet-stream causes rejection).
+  const contentType = upstream.headers.get("content-type") ?? "video/mp4";
   res.setHeader("Content-Type", contentType);
   res.setHeader("Accept-Ranges", "bytes");
 
@@ -460,7 +467,22 @@ async function pipeUpstream(
   if (contentRange) res.setHeader("Content-Range", contentRange);
 
   res.setHeader("Cache-Control", "no-store");
+  // Explicitly suppress Content-Disposition: attachment — ExoPlayer will not
+  // play a stream that the server presents as a download attachment.
+  res.removeHeader("Content-Disposition");
   res.status(upstream.status);
+
+  // HEAD requests: send all headers but no body (ExoPlayer probes before play).
+  if (req.method === "HEAD") {
+    upstream.body?.cancel().catch(() => {});
+    logDebug({
+      method: "HEAD", path: req.path, rangeHeader: range,
+      targetUrl, status: upstream.status, contentType,
+      bytesSent: 0, durationMs: Date.now() - t0,
+    });
+    res.end();
+    return;
+  }
 
   if (!upstream.body) {
     logDebug({
@@ -984,7 +1006,19 @@ router.options("/stream.m3u8", (_req, res) => {
 // aoneroom.com), this endpoint uses neutral headers so GDShine and other
 // HindMoviez CDNs don't reject the request.  It properly forwards the
 // Range header so Stremio can stream large files (>1 GB) in chunks.
-router.get("/hmproxy", async (req: Request, res: Response) => {
+router.all("/hmproxy", async (req: Request, res: Response) => {
+  if (req.method === "OPTIONS") {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Headers", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
+    res.status(204).end();
+    return;
+  }
+  if (req.method !== "GET" && req.method !== "HEAD") {
+    res.status(405).end();
+    return;
+  }
+
   const { u } = req.query as Record<string, string | undefined>;
   if (!u) { res.status(400).json({ error: "Missing u param" }); return; }
 
@@ -1003,6 +1037,8 @@ router.get("/hmproxy", async (req: Request, res: Response) => {
   const upstreamHeaders: Record<string, string> = {
     "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "accept": "*/*",
+    // Force identity encoding so Content-Length matches the piped byte count.
+    "accept-encoding": "identity",
   };
   if (range) upstreamHeaders["range"] = range;
 
@@ -1040,7 +1076,15 @@ router.get("/hmproxy", async (req: Request, res: Response) => {
   if (contentRange) res.setHeader("Content-Range", contentRange);
 
   res.setHeader("Cache-Control", "no-store");
+  res.removeHeader("Content-Disposition");
   res.status(upstream.status);
+
+  // HEAD: send headers only — ExoPlayer probes before play.
+  if (req.method === "HEAD") {
+    upstream.body?.cancel().catch(() => {});
+    res.end();
+    return;
+  }
 
   if (!upstream.body) { res.end(); return; }
 
@@ -1064,14 +1108,19 @@ router.get("/hmproxy", async (req: Request, res: Response) => {
   res.end();
 });
 
-router.options("/hmproxy", (_req, res) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Headers", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
-  res.status(204).end();
-});
+router.all("/proxy", async (req, res) => {
+  if (req.method === "OPTIONS") {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Headers", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
+    res.status(204).end();
+    return;
+  }
+  if (req.method !== "GET" && req.method !== "HEAD") {
+    res.status(405).end();
+    return;
+  }
 
-router.get("/proxy", async (req, res) => {
   const { u, c, ref, ori, lp } = req.query as Record<string, string | undefined>;
 
   if (!u) { res.status(400).json({ error: "Missing u param" }); return; }
@@ -1227,12 +1276,6 @@ router.use("/seg/:b/:c", async (req: Request, res: Response) => {
   }
 });
 
-router.options("/proxy", (_req, res) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Headers", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
-  res.status(204).end();
-});
 
 // ─── DahmerMovies CDN proxy ────────────────────────────────────────────────────
 // Proxies a.111477.xyz file URLs directly — no bulk proxy in the chain.
