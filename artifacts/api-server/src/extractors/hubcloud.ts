@@ -61,14 +61,14 @@ export async function extractHubCloud(
 
     const buzzPromises: Promise<void>[] = [];
 
-    $d("a.btn").each((_, el) => {
+    $d("a.btn, a[class*='btn'], a[class*='button'], a[class*='download']").each((_, el) => {
       const link = $d(el).attr("href") ?? "";
-      const text = $d(el).text().toLowerCase();
+      const text = $d(el).text().toLowerCase().trim();
       const srcName = referer || "HubCloud";
 
       logger.debug({ text, link }, `${TAG}: processing button`);
 
-      if (!link) return;
+      if (!link || link === "#" || link.startsWith("javascript:")) return;
 
       if (text.includes("fsl server")) {
         streams.push({
@@ -79,19 +79,19 @@ export async function extractHubCloud(
           headers: bucketHeaders,
           behaviorHints: { notWebReady: false },
         });
-      } else if (text.includes("download file")) {
+      } else if (text.includes("fslv2")) {
         streams.push({
-          name: srcName,
-          title: `Direct Download ${labelExtras}`,
+          name: `${srcName} [FSLv2]`,
+          title: `FSLv2 ${labelExtras}`,
           url: link,
           type: "mp4",
           headers: bucketHeaders,
           behaviorHints: { notWebReady: false },
         });
-      } else if (text.includes("fslv2")) {
+      } else if (text.includes("download file") || text.includes("direct download") || text.includes("direct link")) {
         streams.push({
-          name: `${srcName} [FSLv2]`,
-          title: `FSLv2 ${labelExtras}`,
+          name: srcName,
+          title: `Direct Download ${labelExtras}`,
           url: link,
           type: "mp4",
           headers: bucketHeaders,
@@ -131,8 +131,35 @@ export async function extractHubCloud(
           type: "mp4",
           behaviorHints: { notWebReady: false },
         });
-      } else if (text.includes("buzzserver")) {
+      } else if (text.includes("buzzserver") || text.includes("buzz server") || text.includes("buzz")) {
         buzzPromises.push(extractBuzzServer(link, srcName, labelExtras, quality, streams));
+      } else if (text.includes("v-cloud") || text.includes("vcloud") || text.includes("v cloud")) {
+        streams.push({
+          name: `${srcName} [V-Cloud]`,
+          title: `V-Cloud ${labelExtras}`,
+          url: link,
+          type: "mp4",
+          headers: bucketHeaders,
+          behaviorHints: { notWebReady: false },
+        });
+      } else if (text.includes("worker") || text.includes("cf worker") || text.includes("cloudflare")) {
+        streams.push({
+          name: `${srcName} [Worker]`,
+          title: `CF Worker ${labelExtras}`,
+          url: link,
+          type: "mp4",
+          headers: bucketHeaders,
+          behaviorHints: { notWebReady: false },
+        });
+      } else if (text.includes("instant") || text.includes("fast server") || /server\s*\d+/i.test(text)) {
+        streams.push({
+          name: `${srcName} [${text.charAt(0).toUpperCase() + text.slice(1, 20)}]`,
+          title: `${labelExtras}`,
+          url: link,
+          type: "mp4",
+          headers: bucketHeaders,
+          behaviorHints: { notWebReady: false },
+        });
       } else {
         logger.debug({ text, link }, `${TAG}: unknown button type`);
       }

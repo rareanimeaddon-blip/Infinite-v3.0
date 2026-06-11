@@ -105,13 +105,12 @@ async function reExtractFromHubCloud(landingPageUrl: string): Promise<string | n
       }
     }
 
-    // Step 2 — fetch the download page and extract a signed CDN URL.
-    // Prefer hub.*.buzz CDN URLs over Cloudflare R2 (pub-*.r2.dev):
-    //   • buzz CDNs accept tokens that are many minutes old — long grace period,
-    //     works reliably when piped through the proxy.
-    //   • R2 has sub-second token precision; some R2 buckets are also private
-    //     ("bucket not viewable"), causing 403 even with a valid redirect.
-    // If no buzz URL is present, fall back to the first available signed URL.
+    // Step 2 — fetch the download page and extract a CDN URL.
+    // Priority order (to avoid Cloudflare R2 private-bucket 403s):
+    //   1. BuzzServer button → call /download → buzz CDN URL (never R2, long-lived)
+    //   2. hub.*.buzz signed URLs in the page (long token grace period)
+    //   3. Non-R2 signed URLs (FSL / S3 / B2)
+    //   4. R2 signed URLs last resort (pub-*.r2.dev — some buckets are private)
     const dlRes = await fetch(downloadPageUrl, {
       headers: { "User-Agent": UPSTREAM_UA, "Referer": landingPageUrl },
       signal: AbortSignal.timeout(12_000),
@@ -122,15 +121,48 @@ async function reExtractFromHubCloud(landingPageUrl: string): Promise<string | n
       return null;
     }
     const dlHtml = await dlRes.text();
-    const signedUrls = [...dlHtml.matchAll(/href="(https?:\/\/[^"]{10,}[?&](?:amp;)?(?:token|Expires)=\d{8,12}[^"]*)"/gi)]
+
+    // Priority 1 — BuzzServer: find any <a> whose visible text contains "buzz"
+    // and call its /download endpoint.  BuzzServer redirects to a hub.*.buzz
+    // CDN URL that is stable and has a long token grace period (unlike R2).
+    const allAnchors = [...dlHtml.matchAll(/<a\b[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi)];
+    for (const [, rawHref, innerHtml] of allAnchors) {
+      if (!rawHref) continue;
+      const visibleText = innerHtml.replace(/<[^>]+>/g, "").toLowerCase().trim();
+      if (!visibleText.includes("buzz")) continue;
+      const buzzLink = rawHref.replace(/&amp;/gi, "&").replace(/\/$/, "");
+      if (!buzzLink.startsWith("http")) continue;
+      try {
+        const buzzRes = await fetch(`${buzzLink}/download`, {
+          headers: { "User-Agent": UPSTREAM_UA, "Referer": downloadPageUrl },
+          redirect: "manual",
+          signal: AbortSignal.timeout(8_000),
+        });
+        const loc = buzzRes.headers.get("hx-redirect") || buzzRes.headers.get("location") || "";
+        if (loc) {
+          logger.info({ loc: loc.slice(0, 100) }, "Proxy: BuzzServer re-extraction → fresh buzz CDN URL");
+          return loc;
+        }
+      } catch (e) {
+        logger.warn({ err: e }, "Proxy: BuzzServer re-extraction failed");
+      }
+    }
+
+    // Priority 2-4 — signed URLs already present in the page HTML
+    const signedUrls = [...dlHtml.matchAll(/href="(https?:\/\/[^"]{10,}[?&](?:amp;)?(?:token|Expires)=\d{9,12}[^"]*)"/gi)]
       .map(m => m[1]!.replace(/&amp;/gi, "&"));
     if (signedUrls.length > 0) {
-      const buzzUrl = signedUrls.find(u => /hub\.[^.]+\.buzz\//i.test(u));
-      const chosen = buzzUrl ?? signedUrls[0]!;
-      logger.info({ chosen: chosen.slice(0, 80), total: signedUrls.length, preferredBuzz: !!buzzUrl }, "Proxy: picked CDN URL from download page");
+      const buzzUrl  = signedUrls.find(u => /hub\.[^.]+\.buzz\//i.test(u));
+      const nonR2Url = signedUrls.find(u => !/pub-[0-9a-f]+\.r2\.dev\//i.test(u));
+      // Prefer buzz > non-R2 > R2 (R2 private buckets return 403 regardless)
+      const chosen = buzzUrl ?? nonR2Url ?? signedUrls[0]!;
+      logger.info(
+        { chosen: chosen.slice(0, 80), total: signedUrls.length, preferredBuzz: !!buzzUrl, isR2: /pub-[0-9a-f]+\.r2\.dev\//i.test(chosen) },
+        "Proxy: picked CDN URL from download page signed URLs",
+      );
       return chosen;
     }
-    logger.warn({ url: downloadPageUrl.slice(0, 80) }, "Proxy: no signed CDN URL found on HubCloud download page");
+    logger.warn({ url: downloadPageUrl.slice(0, 80) }, "Proxy: no CDN URL found on HubCloud download page");
     return null;
   } catch (err) {
     logger.warn({ err }, "Proxy: reExtractFromHubCloud error");
@@ -147,14 +179,33 @@ async function refreshFromDownloadPage(downloadPageUrl: string): Promise<string 
     });
     if (!pageRes.ok) return null;
     const html = await pageRes.text();
-    const signedUrls = [...html.matchAll(/href="(https?:\/\/[^"]{10,}[?&](?:amp;)?(?:token|Expires)=\d{8,12}[^"]*)"/gi)]
+
+    // Priority 1: BuzzServer button → /download redirect → buzz CDN URL
+    const anchors = [...html.matchAll(/<a\b[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi)];
+    for (const [, rawHref, inner] of anchors) {
+      if (!rawHref) continue;
+      const text = inner.replace(/<[^>]+>/g, "").toLowerCase().trim();
+      if (!text.includes("buzz")) continue;
+      const link = rawHref.replace(/&amp;/gi, "&").replace(/\/$/, "");
+      if (!link.startsWith("http")) continue;
+      try {
+        const bRes = await fetch(`${link}/download`, {
+          headers: { "User-Agent": UPSTREAM_UA, "Referer": downloadPageUrl },
+          redirect: "manual",
+          signal: AbortSignal.timeout(8_000),
+        });
+        const loc = bRes.headers.get("hx-redirect") || bRes.headers.get("location") || "";
+        if (loc) return loc;
+      } catch { /* ignore, fall through */ }
+    }
+
+    // Priority 2-4: signed URLs — prefer buzz > non-R2 > R2
+    const signedUrls = [...html.matchAll(/href="(https?:\/\/[^"]{10,}[?&](?:amp;)?(?:token|Expires)=\d{9,12}[^"]*)"/gi)]
       .map(m => m[1]!.replace(/&amp;/gi, "&"));
     if (signedUrls.length > 0) {
-      // Prefer hub.*.buzz over R2 — buzz CDNs have long token grace periods
-      // and work reliably when piped; R2 has sub-second precision and can have
-      // private buckets ("bucket not viewable" 403).
-      const buzzUrl = signedUrls.find(u => /hub\.[^.]+\.buzz\//i.test(u));
-      return buzzUrl ?? signedUrls[0]!;
+      const buzzUrl  = signedUrls.find(u => /hub\.[^.]+\.buzz\//i.test(u));
+      const nonR2Url = signedUrls.find(u => !/pub-[0-9a-f]+\.r2\.dev\//i.test(u));
+      return buzzUrl ?? nonR2Url ?? signedUrls[0]!;
     }
     return null;
   } catch {
@@ -945,20 +996,14 @@ router.get("/proxy", async (req, res) => {
           }
 
           if (freshUrl) {
-            // R2 signed URLs use sub-second token precision.  By the time our
-            // server finishes the two-step extraction (~800 ms) and starts
-            // piping, the token has already ticked past its expiry second and
-            // R2 returns 403.
-            //
-            // Sending a 302 redirect lets the *player device* hit R2 directly:
-            // it arrives only ~50–150 ms after we obtained the URL, which is
-            // within any reasonable CDN grace window — whereas our full proxy
-            // path adds another 500–800 ms on top.
-            if (/pub-[0-9a-f]+\.r2\.dev\//i.test(freshUrl)) {
-              logger.info({ freshUrl: freshUrl.slice(0, 100) }, "Proxy: 302 → fresh R2 URL (player hits CDN directly)");
-              res.redirect(302, freshUrl);
-              return;
-            }
+            // Always pipe through our proxy (never redirect).
+            // R2 private buckets ("bucket not viewable") return 403 for ANY
+            // request to pub-*.r2.dev — including 302 redirects — because the
+            // bucket requires custom-domain access.  Proxying the signed URL
+            // directly works as long as the token hasn't yet expired, which it
+            // hasn't since we just extracted it.  buzz CDN URLs tolerate the
+            // extra proxy latency easily (long token grace period).
+            logger.info({ freshUrl: freshUrl.slice(0, 100) }, "Proxy: proactively updated targetUrl with fresh CDN URL");
             targetUrl = freshUrl;
           }
         } catch (err) {
@@ -971,20 +1016,15 @@ router.get("/proxy", async (req, res) => {
     // If the CDN still returns 403/404 after proactive refresh (or for streams
     // with no numeric token), attempt re-extraction from the landing page, then
     // fall back to the download-page refresh.
-    // For R2 CDN URLs, redirect the player directly (see comment above).
+    // Always pipe fresh URLs through our proxy — never redirect to R2 directly,
+    // since private R2 buckets return 403 for all pub-*.r2.dev requests.
     const onError = (landingPage || extraHeaders?.referer)
       ? async (status: number): Promise<string | null> => {
           if (status !== 403 && status !== 404) return null;
           if (landingPage) {
             logger.info({ status, lp: landingPage.slice(0, 80) }, "Proxy: reactive re-extract from HubCloud landing page");
             const freshUrl = await reExtractFromHubCloud(landingPage);
-            if (freshUrl) {
-              if (/pub-[0-9a-f]+\.r2\.dev\//i.test(freshUrl)) {
-                res.redirect(302, freshUrl);
-                return null; // signal pipeUpstream to stop
-              }
-              return freshUrl;
-            }
+            if (freshUrl) return freshUrl;
           }
           if (extraHeaders?.referer) {
             logger.info({ status, referer: extraHeaders.referer.slice(0, 80) }, "Proxy: reactive refresh from download page");
