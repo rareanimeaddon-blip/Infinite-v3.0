@@ -621,6 +621,21 @@ function hd4uStreamToStremio(s: Stream, req?: Request): Record<string, unknown> 
       behaviorHints: { notWebReady: false },
     };
   }
+  // No Referer and not R2 — still route through proxy so ExoPlayer gets correct
+  // Content-Type, HEAD support, and re-extraction on token expiry.
+  // BuzzServer / ZipDisk / 10Gbps CDN URLs are token-based and work without
+  // Referer, so the proxy can fetch them with its default neutral headers.
+  if (req) {
+    const base = apiBase(req);
+    const lpParam = s.reExtractUrl ? `&lp=${encodeParam(s.reExtractUrl)}` : "";
+    const proxiedUrl = `${base}/proxy?u=${encodeParam(s.url)}${lpParam}`;
+    return {
+      name: s.name,
+      title: s.title,
+      url: proxiedUrl,
+      behaviorHints: { notWebReady: false },
+    };
+  }
   return {
     name: s.name,
     title: s.title,
@@ -661,6 +676,18 @@ function fourkdStreamToStremio(s: import("../providers/fourkdhub.js").FourkdStre
       title: s.title,
       url: proxiedUrl,
       behaviorHints: { ...s.behaviorHints, notWebReady: false },
+    };
+  }
+  // No Referer and not R2 — still route through proxy for ExoPlayer compatibility.
+  if (req) {
+    const base = apiBase(req);
+    const lpParam = s.reExtractUrl ? `&lp=${encodeParam(s.reExtractUrl)}` : "";
+    const proxiedUrl = `${base}/proxy?u=${encodeParam(s.url)}${lpParam}`;
+    return {
+      name: s.name,
+      title: s.title,
+      url: proxiedUrl,
+      behaviorHints: { notWebReady: false },
     };
   }
   return {

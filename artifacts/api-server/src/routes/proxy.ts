@@ -454,9 +454,13 @@ async function pipeUpstream(
     return;
   }
 
-  // Prefer the upstream content-type; fall back to video/mp4 so ExoPlayer
-  // recognises the stream as video (application/octet-stream causes rejection).
-  const contentType = upstream.headers.get("content-type") ?? "video/mp4";
+  // Prefer the upstream content-type but override application/octet-stream and
+  // missing types with video/mp4 — ExoPlayer hard-rejects octet-stream and any
+  // non-video/* / non-application/x-mpegurl content-type.
+  const rawCt = upstream.headers.get("content-type") ?? "";
+  const contentType = (rawCt && rawCt !== "application/octet-stream" && rawCt !== "binary/octet-stream")
+    ? rawCt
+    : "video/mp4";
   res.setHeader("Content-Type", contentType);
   res.setHeader("Accept-Ranges", "bytes");
 
@@ -1065,7 +1069,10 @@ router.all("/hmproxy", async (req: Request, res: Response) => {
     return;
   }
 
-  const contentType = upstream.headers.get("content-type") ?? "video/mp4";
+  const rawHmCt = upstream.headers.get("content-type") ?? "";
+  const contentType = (rawHmCt && rawHmCt !== "application/octet-stream" && rawHmCt !== "binary/octet-stream")
+    ? rawHmCt
+    : "video/mp4";
   res.setHeader("Content-Type", contentType);
   res.setHeader("Accept-Ranges", "bytes");
 
