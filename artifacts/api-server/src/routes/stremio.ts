@@ -557,6 +557,12 @@ function apiBase(req: Request): string {
 
 // ─── HDHub4U helpers ──────────────────────────────────────────────────────────
 
+/** True for plain pub-*.r2.dev URLs that have no presigning params. */
+function isPlainR2(url: string): boolean {
+  return /pub-[0-9a-f]{10,}\.r2\.dev\//i.test(url) &&
+         !/[?&](X-Amz-Signature|token|Expires)=/i.test(url);
+}
+
 function hd4uStreamToStremio(s: Stream, req?: Request): Record<string, unknown> {
   const isHls = s.type === "hls" || (s.url.includes(".m3u8") && s.type !== "mp4");
   if (isHls && req) {
@@ -572,6 +578,28 @@ function hd4uStreamToStremio(s: Stream, req?: Request): Record<string, unknown> 
       behaviorHints: { notWebReady: true },
     };
   }
+
+  // Plain pub-*.r2.dev private bucket URLs must NOT go through our proxy.
+  // Our server (Cloudflare data-centre IP) is blocked by R2; the player's
+  // mobile/residential IP can access public R2 buckets directly.
+  // We still wrap in the proxy so the proxy can attempt re-extraction for a
+  // better CDN URL (BuzzServer / 10Gbps), and only fall back to a 302 redirect
+  // to R2 if no better option is found — the player follows the redirect from
+  // its own IP.
+  if (req && isPlainR2(s.url)) {
+    const base = apiBase(req);
+    const lpParam = s.reExtractUrl ? `&lp=${encodeParam(s.reExtractUrl)}` : "";
+    const referer = s.headers?.["Referer"] || s.headers?.["referer"] || "";
+    const refParam = referer ? `&ref=${encodeParam(referer)}` : "";
+    const proxiedUrl = `${base}/proxy?u=${encodeParam(s.url)}${refParam}${lpParam}`;
+    return {
+      name: s.name,
+      title: s.title,
+      url: proxiedUrl,
+      behaviorHints: { notWebReady: false },
+    };
+  }
+
   // For MP4 streams that carry a Referer header (e.g. Backblaze B2 / FSL /
   // S3 buckets from HubCloud), route through the addon proxy so the correct
   // Referer is sent server-side — players/Stremio do not forward proxyHeaders
@@ -606,6 +634,21 @@ function hd4uStreamToStremio(s: Stream, req?: Request): Record<string, unknown> 
 }
 
 function fourkdStreamToStremio(s: import("../providers/fourkdhub.js").FourkdStream, req?: Request): Record<string, unknown> {
+  // Plain R2 private bucket URLs — proxy attempts re-extraction for a better
+  // CDN URL; falls back to 302 redirect so the player's own IP reaches R2.
+  if (req && isPlainR2(s.url)) {
+    const base = apiBase(req);
+    const lpParam = s.reExtractUrl ? `&lp=${encodeParam(s.reExtractUrl)}` : "";
+    const referer = s.headers?.["Referer"] || s.headers?.["referer"] || "";
+    const refParam = referer ? `&ref=${encodeParam(referer)}` : "";
+    const proxiedUrl = `${base}/proxy?u=${encodeParam(s.url)}${refParam}${lpParam}`;
+    return {
+      name: s.name,
+      title: s.title,
+      url: proxiedUrl,
+      behaviorHints: { notWebReady: false },
+    };
+  }
   const referer = s.headers?.["Referer"] || s.headers?.["referer"] || "";
   if (referer && req) {
     const base = apiBase(req);

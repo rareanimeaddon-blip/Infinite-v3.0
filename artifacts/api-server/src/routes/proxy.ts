@@ -21,6 +21,12 @@ function decodeParam(s: string): string {
   return Buffer.from(s, "base64url").toString("utf8");
 }
 
+/** True for plain pub-*.r2.dev URLs that have no presigning params. */
+function isPlainR2(url: string): boolean {
+  return /pub-[0-9a-f]{10,}\.r2\.dev\//i.test(url) &&
+         !/[?&](X-Amz-Signature|token|Expires)=/i.test(url);
+}
+
 /**
  * Follow HTTP redirects manually so we can preserve custom headers (especially
  * Referer) across hops.  The native `redirect: "follow"` strips Referer on
@@ -1021,17 +1027,16 @@ router.get("/proxy", async (req, res) => {
     //
     // In both cases, pipe the fresh URL through our proxy (never redirect to R2).
 
-    const isPlainR2 = /pub-[0-9a-f]{10,}\.r2\.dev\//i.test(targetUrl) &&
-                      !/[?&](X-Amz-Signature|token|Expires)=/i.test(targetUrl);
+    const targetIsPlainR2 = isPlainR2(targetUrl);
 
     const numericTokenMatch = /[?&](?:token|Expires)=(\d{9,11})(?:[&#]|$)/.exec(targetUrl);
     const tokenExpired = numericTokenMatch
       ? parseInt(numericTokenMatch[1]!) <= Math.floor(Date.now() / 1000) + 60
       : false;
 
-    if ((isPlainR2 || tokenExpired) && (landingPage || extraHeaders?.referer)) {
+    if ((targetIsPlainR2 || tokenExpired) && (landingPage || extraHeaders?.referer)) {
       logger.info(
-        { isPlainR2, tokenExpired, url: targetUrl.slice(0, 100) },
+        { isPlainR2: targetIsPlainR2, tokenExpired, url: targetUrl.slice(0, 100) },
         "Proxy: proactive re-extraction triggered",
       );
       try {
@@ -1051,17 +1056,24 @@ router.get("/proxy", async (req, res) => {
           }
         }
 
-        if (freshUrl) {
-          logger.info({ freshUrl: freshUrl.slice(0, 100) }, "Proxy: using fresh CDN URL");
+        if (freshUrl && !isPlainR2(freshUrl)) {
+          // Got a better (non-R2) CDN URL — pipe through proxy
+          logger.info({ freshUrl: freshUrl.slice(0, 100) }, "Proxy: using fresh non-R2 CDN URL");
           targetUrl = freshUrl;
-        } else if (isPlainR2) {
-          // Plain R2 URL and re-extraction failed — nothing will work, give up early.
-          logger.warn({ lp: landingPage?.slice(0, 80) }, "Proxy: plain R2 URL and re-extraction failed — returning 503");
-          if (!res.headersSent) res.status(503).json({ error: "Stream temporarily unavailable — CDN is private R2. Try again." });
+        } else {
+          // Re-extraction failed or still returned R2 — redirect player directly.
+          // The player's mobile/residential IP can access public R2 buckets even
+          // when our Cloudflare data-centre IP is blocked.
+          const redirectTo = freshUrl ?? targetUrl;
+          logger.info({ redirectTo: redirectTo.slice(0, 100) }, "Proxy: R2 fallback — 302 redirect to R2 for direct player fetch");
+          if (!res.headersSent) res.redirect(302, redirectTo);
           return;
         }
       } catch (err) {
-        logger.warn({ err }, "Proxy: proactive refresh failed — will retry reactively on 403");
+        // On unexpected error, still redirect rather than returning an error status
+        logger.warn({ err }, "Proxy: proactive refresh error — 302 redirect to R2 as fallback");
+        if (!res.headersSent) res.redirect(302, targetUrl);
+        return;
       }
     }
 

@@ -155,22 +155,19 @@ export async function extractHubCloud(
           behaviorHints: { notWebReady: false },
         });
       } else if (link.includes("r2.dev")) {
-        // Plain pub-*.r2.dev private bucket URLs (no presigning params) are
-        // inaccessible — "This bucket cannot be viewed" 403 for ALL requests.
-        // Only add if presigned (has X-Amz-Signature / token / Expires).
-        const isPresigned = /[?&](X-Amz-Signature|token|Expires)=/i.test(link);
-        if (isPresigned) {
-          streams.push({
-            name: `${srcName} [Direct R2]`,
-            title: `Direct ${labelExtras}`,
-            url: link,
-            type: "mp4",
-            headers: bucketHeaders,
-            behaviorHints: { notWebReady: false },
-          });
-        } else {
-          logger.debug({ link }, `${TAG}: skipping plain R2 private bucket URL`);
-        }
+        // Include ALL R2 URLs — presigned or plain private bucket.
+        // hd4uStreamToStremio / fourkdStreamToStremio will route these through
+        // the proxy, which first tries re-extraction for a better CDN URL
+        // (BuzzServer / 10Gbps), then falls back to a 302 redirect so the
+        // player's own IP can reach the R2 bucket directly.
+        streams.push({
+          name: `${srcName} [Direct R2]`,
+          title: `Direct ${labelExtras}`,
+          url: link,
+          type: "mp4",
+          headers: bucketHeaders,
+          behaviorHints: { notWebReady: false },
+        });
       } else if (text.includes("v-cloud") || text.includes("vcloud") || text.includes("v cloud")) {
         streams.push({
           name: `${srcName} [V-Cloud]`,
