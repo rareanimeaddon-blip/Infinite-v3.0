@@ -2073,6 +2073,28 @@ async function computeRelayM3u8(hash: string, playerCdn: string, proxyBase: stri
     }
   }
 
+  // For CDN multi-quality masters (isVariant=false), collapse to the single
+  // highest-bandwidth variant before serving to LG TV WebOS.
+  //
+  // Why: LG TV attempts ABR quality-switching at ~5 s intervals; each switch
+  // is a codec re-init that WebOS cannot recover from, producing a video
+  // freeze 2–5 s after playback starts (identical to the old RareAnime bug,
+  // fixed there via filterToSingleVariant).
+  //
+  // filterToSingleVariantProxy preserves all #EXT-X-MEDIA audio renditions
+  // (the audio group system is orthogonal to quality variant selection) so
+  // language switching and the Hindi-first ordering set above are unaffected.
+  //
+  // For plain variant playlists (isVariant=true, single-track fallback path
+  // below) the function is a no-op: no #EXT-X-STREAM-INF line is present.
+  const withSingleVariant = filterToSingleVariantProxy(withHindiFirst);
+  if (withSingleVariant !== withHindiFirst) {
+    logger.info(
+      { hash },
+      "AnimeSalt relay: collapsed multi-variant CDN master to single variant for LG WebOS ABR compatibility"
+    );
+  }
+
   // If we're wrapping a CDN variant and detected multiple audio tracks,
   // synthesise a proper HLS master playlist with #EXT-X-MEDIA:TYPE=AUDIO
   // entries pointing to our per-PID audio rendition proxy endpoints.
@@ -2127,7 +2149,7 @@ async function computeRelayM3u8(hash: string, playerCdn: string, proxyBase: stri
     ].join("\n");
   }
 
-  return withHindiFirst;
+  return withSingleVariant;
 }
 
 // Returns a promise that resolves to the rewritten m3u8, using the cache and
