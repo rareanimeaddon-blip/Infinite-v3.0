@@ -360,6 +360,48 @@ async function refreshFromDownloadPage(downloadPageUrl: string): Promise<string 
   }
 }
 
+/**
+ * Normalise a CDN-supplied Content-Type to a value ExoPlayer accepts.
+ *
+ * CDNs are inconsistent:
+ *   - HubCloud FSL/buzz: "video/mkv" for Matroska, "application/octet-stream" for MP4
+ *   - Some CDNs: no Content-Type at all
+ *
+ * ExoPlayer only recognises IANA-registered types and will silently fail
+ * (Position 0ms, Codec N/A) if it receives an unknown type like "video/mkv".
+ *
+ * When the type is ambiguous we sniff the first bytes of the response body.
+ */
+function resolveContentType(raw: string, firstBytes?: Uint8Array): string {
+  // ── Known wrong labels ────────────────────────────────────────────────────
+  // "video/mkv" / "video/x-mkv" are not IANA types; ExoPlayer has no parser
+  // registered for them.  The correct type is "video/x-matroska".
+  if (raw === "video/mkv" || raw === "video/x-mkv") return "video/x-matroska";
+
+  // ── Unambiguous types — trust the CDN ────────────────────────────────────
+  if (raw && raw !== "application/octet-stream" && raw !== "binary/octet-stream") {
+    return raw;
+  }
+
+  // ── Ambiguous / missing type — sniff magic bytes ──────────────────────────
+  if (firstBytes && firstBytes.length >= 8) {
+    // MKV / WebM: EBML magic  1A 45 DF A3
+    if (firstBytes[0] === 0x1a && firstBytes[1] === 0x45 &&
+        firstBytes[2] === 0xdf && firstBytes[3] === 0xa3) {
+      return "video/x-matroska";
+    }
+    // MP4: 'ftyp' box at offset 4  (66 74 79 70)
+    if (firstBytes[4] === 0x66 && firstBytes[5] === 0x74 &&
+        firstBytes[6] === 0x79 && firstBytes[7] === 0x70) {
+      return "video/mp4";
+    }
+    // MPEG-TS: sync byte 0x47 at offset 0
+    if (firstBytes[0] === 0x47) return "video/mp2t";
+  }
+
+  return "video/mp4"; // safe default
+}
+
 async function pipeUpstream(
   targetUrl: string,
   cookie: string | undefined,
@@ -454,13 +496,58 @@ async function pipeUpstream(
     return;
   }
 
-  // Prefer the upstream content-type but override application/octet-stream and
-  // missing types with video/mp4 — ExoPlayer hard-rejects octet-stream and any
-  // non-video/* / non-application/x-mpegurl content-type.
+  // HEAD: we still need headers but no body — skip the peek.
+  if (req.method === "HEAD") {
+    const rawCtHead = upstream.headers.get("content-type") ?? "";
+    const contentTypeHead = resolveContentType(rawCtHead);
+    res.setHeader("Content-Type", contentTypeHead);
+    res.setHeader("Accept-Ranges", "bytes");
+    const clHead = upstream.headers.get("content-length");
+    if (clHead) res.setHeader("Content-Length", clHead);
+    const crHead = upstream.headers.get("content-range");
+    if (crHead) res.setHeader("Content-Range", crHead);
+    res.setHeader("Cache-Control", "no-store");
+    res.removeHeader("Content-Disposition");
+    res.status(upstream.status);
+    upstream.body?.cancel().catch(() => {});
+    logDebug({
+      method: "HEAD", path: req.path, rangeHeader: range,
+      targetUrl, status: upstream.status, contentType: contentTypeHead,
+      bytesSent: 0, durationMs: Date.now() - t0,
+    });
+    res.end();
+    return;
+  }
+
+  if (!upstream.body) {
+    res.setHeader("Content-Type", resolveContentType(upstream.headers.get("content-type") ?? ""));
+    res.setHeader("Accept-Ranges", "bytes");
+    res.setHeader("Cache-Control", "no-store");
+    res.removeHeader("Content-Disposition");
+    res.status(upstream.status);
+    logDebug({
+      method: req.method, path: req.path, rangeHeader: range,
+      targetUrl, status: upstream.status, contentType: "unknown",
+      bytesSent: 0, durationMs: Date.now() - t0,
+    });
+    res.end();
+    return;
+  }
+
+  // Peek first chunk so we can sniff magic bytes for content-type detection
+  // BEFORE writing any headers (headers must be set before the first write).
+  const reader = upstream.body.getReader();
+  req.on("close", () => reader.cancel().catch(() => {}));
+
+  let firstChunk: Uint8Array | undefined;
+  try {
+    const { done, value } = await reader.read();
+    if (!done && value?.length) firstChunk = value;
+  } catch { /* stream ended or errored before first byte */ }
+
   const rawCt = upstream.headers.get("content-type") ?? "";
-  const contentType = (rawCt && rawCt !== "application/octet-stream" && rawCt !== "binary/octet-stream")
-    ? rawCt
-    : "video/mp4";
+  const contentType = resolveContentType(rawCt, firstChunk);
+
   res.setHeader("Content-Type", contentType);
   res.setHeader("Accept-Ranges", "bytes");
 
@@ -471,38 +558,17 @@ async function pipeUpstream(
   if (contentRange) res.setHeader("Content-Range", contentRange);
 
   res.setHeader("Cache-Control", "no-store");
-  // Explicitly suppress Content-Disposition: attachment — ExoPlayer will not
-  // play a stream that the server presents as a download attachment.
+  // Suppress Content-Disposition: attachment — ExoPlayer won't play download-mode responses.
   res.removeHeader("Content-Disposition");
   res.status(upstream.status);
 
-  // HEAD requests: send all headers but no body (ExoPlayer probes before play).
-  if (req.method === "HEAD") {
-    upstream.body?.cancel().catch(() => {});
-    logDebug({
-      method: "HEAD", path: req.path, rangeHeader: range,
-      targetUrl, status: upstream.status, contentType,
-      bytesSent: 0, durationMs: Date.now() - t0,
-    });
-    res.end();
-    return;
-  }
-
-  if (!upstream.body) {
-    logDebug({
-      method: req.method, path: req.path, rangeHeader: range,
-      targetUrl, status: upstream.status, contentType,
-      bytesSent: 0, durationMs: Date.now() - t0,
-    });
-    res.end();
-    return;
-  }
-
-  const reader = upstream.body.getReader();
-  req.on("close", () => reader.cancel().catch(() => {}));
-
   let bytesSent = 0;
   try {
+    // Write the already-read first chunk, then stream the rest.
+    if (firstChunk?.length && !res.destroyed) {
+      res.write(Buffer.from(firstChunk));
+      bytesSent += firstChunk.byteLength;
+    }
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -1069,10 +1135,46 @@ router.all("/hmproxy", async (req: Request, res: Response) => {
     return;
   }
 
+  // HEAD: return headers only — no body peek needed.
+  if (req.method === "HEAD") {
+    const rawCtHead = upstream.headers.get("content-type") ?? "";
+    res.setHeader("Content-Type", resolveContentType(rawCtHead));
+    res.setHeader("Accept-Ranges", "bytes");
+    const clHead = upstream.headers.get("content-length");
+    if (clHead) res.setHeader("Content-Length", clHead);
+    const crHead = upstream.headers.get("content-range");
+    if (crHead) res.setHeader("Content-Range", crHead);
+    res.setHeader("Cache-Control", "no-store");
+    res.removeHeader("Content-Disposition");
+    res.status(upstream.status);
+    upstream.body?.cancel().catch(() => {});
+    res.end();
+    return;
+  }
+
+  if (!upstream.body) {
+    res.setHeader("Content-Type", resolveContentType(upstream.headers.get("content-type") ?? ""));
+    res.setHeader("Accept-Ranges", "bytes");
+    res.setHeader("Cache-Control", "no-store");
+    res.removeHeader("Content-Disposition");
+    res.status(upstream.status);
+    res.end();
+    return;
+  }
+
+  // Peek first chunk for magic-byte content-type detection before setting headers.
+  const reader = upstream.body.getReader();
+  req.on("close", () => reader.cancel().catch(() => {}));
+
+  let firstChunk: Uint8Array | undefined;
+  try {
+    const { done, value } = await reader.read();
+    if (!done && value?.length) firstChunk = value;
+  } catch { /* stream ended early */ }
+
   const rawHmCt = upstream.headers.get("content-type") ?? "";
-  const contentType = (rawHmCt && rawHmCt !== "application/octet-stream" && rawHmCt !== "binary/octet-stream")
-    ? rawHmCt
-    : "video/mp4";
+  const contentType = resolveContentType(rawHmCt, firstChunk);
+
   res.setHeader("Content-Type", contentType);
   res.setHeader("Accept-Ranges", "bytes");
 
@@ -1086,20 +1188,12 @@ router.all("/hmproxy", async (req: Request, res: Response) => {
   res.removeHeader("Content-Disposition");
   res.status(upstream.status);
 
-  // HEAD: send headers only — ExoPlayer probes before play.
-  if (req.method === "HEAD") {
-    upstream.body?.cancel().catch(() => {});
-    res.end();
-    return;
-  }
-
-  if (!upstream.body) { res.end(); return; }
-
-  const reader = upstream.body.getReader();
-  req.on("close", () => reader.cancel().catch(() => {}));
-
   let bytesSent = 0;
   try {
+    if (firstChunk?.length && !res.destroyed) {
+      res.write(Buffer.from(firstChunk));
+      bytesSent += firstChunk.byteLength;
+    }
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;

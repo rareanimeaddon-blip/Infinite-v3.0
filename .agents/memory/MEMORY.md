@@ -3,3 +3,4 @@
 - [AnimeSalt LG TV video freeze fix](animesalt-lg-tv-freeze.md) — muxed video TS + external AUDIO= group causes LG WebOS video renderer to freeze; fix is to strip CDN audio renditions from outer master.
 - [HubCloud BuzzServer HTML-body change](hubcloud-buzzserver-html.md) — BuzzServer /download now returns 200 HTML instead of redirect; must read body and extract id="download" href for the CDN URL.
 - [HubCloud R2 private bucket strategy](hubcloud-r2-strategy.md) — Plain pub-*.r2.dev URLs: proxy tries re-extraction (BuzzServer→10Gbps→ZipDisk), then 302 redirect to R2 (player's IP bypasses server-side block). extract10Gbps must not push original link on redirect failure.
+- [ExoPlayer MIME type normalization](exoplayer-mime-types.md) — HubCloud CDNs send "video/mkv" for MKV files; ExoPlayer silently fails (0ms position, Codec N/A). Fix: resolveContentType() in proxy.ts normalises to video/x-matroska + magic-byte sniffs octet-stream.
