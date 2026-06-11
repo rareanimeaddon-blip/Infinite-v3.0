@@ -269,6 +269,41 @@ async function extractBuzzServer(
   }
 }
 
+/**
+ * hubcloud.cx redirect chain:
+ *   gpdl.hubcloud.cx/?id=... → gpdl.*.workers.dev/?id=... → gamerxyt.com/dl.php?link=VIDEO_URL
+ *
+ * The final hop (dl.php) returns 200 HTML — the actual video URL is the `link=`
+ * query parameter on that URL.  We follow all redirects and extract it.
+ */
+async function resolveHubcloudCxUrl(link: string): Promise<string> {
+  try {
+    const resp = await fetch(link, {
+      headers: BROWSER_HEADERS,
+      redirect: "follow",
+      signal: AbortSignal.timeout(15_000),
+    });
+    const finalUrl = resp.url;
+    try {
+      const u = new URL(finalUrl);
+      const videoLink = u.searchParams.get("link");
+      if (videoLink && videoLink.startsWith("http")) {
+        logger.info({ videoLink: videoLink.slice(0, 80) }, "HubCloud 10Gbps: extracted video URL via dl.php chain");
+        return videoLink;
+      }
+    } catch { /* invalid URL, fall through */ }
+    // If the final URL itself is a direct video URL (not an HTML wrapper), use it
+    if (finalUrl && finalUrl.startsWith("http") && !/\.php(\?|$)/.test(finalUrl)) {
+      return finalUrl;
+    }
+    logger.warn({ link, finalUrl }, "HubCloud 10Gbps: redirect chain did not resolve to a video URL");
+    return "";
+  } catch (e) {
+    logger.warn({ err: e, link }, "HubCloud 10Gbps: resolveHubcloudCxUrl error");
+    return "";
+  }
+}
+
 async function extract10Gbps(
   link: string,
   srcName: string,
@@ -279,7 +314,8 @@ async function extract10Gbps(
   try {
     let finalUrl = "";
     if (link.includes("hubcloud.cx")) {
-      finalUrl = link;
+      // Follow the full chain: hubcloud.cx → workers.dev → dl.php?link=VIDEO_URL
+      finalUrl = await resolveHubcloudCxUrl(link);
     } else {
       // Follow redirect to extract the link= query param
       const resp = await getNoRedirect(link);

@@ -1,35 +1,44 @@
 ---
-name: HubCloud R2 private bucket strategy
-description: How to handle plain pub-*.r2.dev URLs from HubCloud (HDHub4U / 4KHDHub) — server-side proxy cannot reach them but the player's IP can.
+name: HubCloud R2 strategy and download page structure
+description: Complete HubCloud download chain as of 2025-06, including FSL Server R2, 10Gbps hubcloud.cx chain, and what gamerxyt.com handles.
 ---
 
+## Current HubCloud download chain (2025-06)
+
+### Landing page → download page
+- Landing: `hubcloud.foo/drive/SLUG`
+- `id="download"` href → `gamerxyt.com/hubcloud.php?host=hubcloud&id=SLUG&token=TOKEN`
+  - **NOTE**: download page is now on `gamerxyt.com`, not `hubcloud.dad`. Code checks `url.includes("hubcloud.php")` which matches either domain. ✓
+
+### Download page buttons (class="btn btn-*")
+1. **FSL Server** (`btn-success`): `pub-*.r2.dev/HASH?token=TIMESTAMP`
+   - Signed R2 with `?token=` — accessible from server-side (200 OK) even from data-centre IPs
+   - Token is a Unix timestamp expiry, short-lived (hours)
+   - `isPlainR2()` returns false for `?token=` URLs → routed through proxy with `ori=` param ✓
+2. **10Gbps** (`btn-danger`): `gpdl.hubcloud.cx/?id=LONG_HASH::SHORT_HASH`
+   - Chain: hubcloud.cx → workers.dev → `gamerxyt.com/dl.php?link=GOOGLE_VIDEO_URL` (200 HTML)
+   - The `dl.php` wrapper returns **200 HTML**, NOT a redirect
+   - Actual video URL is in the `?link=` query param of the final `dl.php` URL
+   - Must use `redirect: "follow"` and extract `link=` param from `resp.url`
+
+### No BuzzServer buttons on this page format
+The current HubCloud download page does NOT have BuzzServer buttons. BuzzServer handling still exists for older pages.
+
 ## Rule
-Plain `pub-*.r2.dev` URLs (no `X-Amz-Signature`, `token`, or `Expires` params) must never be proxied directly — always attempt re-extraction first, then fall back to a 302 redirect for the player.
+Whenever a hubcloud.cx URL is encountered (in `extract10Gbps` or proxy re-extraction):
+1. Use `fetch(url, { redirect: "follow" })` to follow the full chain
+2. Check `new URL(resp.url).searchParams.get("link")` for the video URL
+3. If found and starts with "http" → that IS the video URL
 
 ## Why
-Cloudflare R2 private buckets return 403 "This bucket cannot be viewed" for all requests from data-centre IP ranges (including Replit). The player's mobile/residential IP can access public R2 buckets directly. Proxying through our server guarantees a 403; a 302 redirect gives the player a chance.
+gpdl.hubcloud.cx redirects to a Cloudflare Workers endpoint, which redirects to `gamerxyt.com/dl.php?link=VIDEO_URL`. The dl.php page is an HTML wrapper — the video URL is ONLY in the URL query parameter `link=`, not the response body.
 
 ## How to apply
+- `extract10Gbps` in `hubcloud.ts`: calls `resolveHubcloudCxUrl(link)` → follows chain → returns Google Video URL
+- Priority 2 in `reExtractFromHubCloud` in `proxy.ts`: same inline logic
+- `refreshFromDownloadPage` in `proxy.ts`: same inline logic for Priority 2
 
-### In `hd4uStreamToStremio` / `fourkdStreamToStremio` (stremio.ts)
-- Before the `referer && req` proxy branch, check `isPlainR2(s.url)`.
-- If true, route through proxy with `lp=` but no `ori=` (proxy handles redirect, not piping).
-
-### In proxy route `/proxy` (proxy.ts)
-- `isPlainR2(targetUrl)` AND `(landingPage || referer)` → trigger proactive re-extraction.
-- `reExtractFromHubCloud(landingPage)` tries BuzzServer → 10Gbps → ZipDisk → signed URLs → direct video links.
-- If fresh non-R2 URL found → pipe it through proxy.
-- If re-extraction fails or returns another R2 URL → `res.redirect(302, targetUrl)`.
-
-### In `extract10Gbps` (hubcloud.ts)
-- Only push a stream if a redirect was actually found (`finalUrl !== ""`).
-- If `getNoRedirect` finds no `location` header, skip — the original button URL is an HTML page, not a CDN URL.
-
-### `isPlainR2(url)` definition
-```typescript
-function isPlainR2(url: string): boolean {
-  return /pub-[0-9a-f]{10,}\.r2\.dev\//i.test(url) &&
-         !/[?&](X-Amz-Signature|token|Expires)=/i.test(url);
-}
-```
-Defined at top-level in both `proxy.ts` and `stremio.ts`.
+## R2 plain bucket handling (no token)
+Plain `pub-*.r2.dev` URLs (no `?token=`) are blocked by R2 for data-centre IPs:
+- `isPlainR2()` detects these: `/pub-[0-9a-f]{10,}\.r2\.dev\//i.test(url) && !/[?&](X-Amz-Signature|token|Expires)=/i.test(url)`
+- Route through proxy for re-extraction; if re-extraction fails → 302 redirect so player's IP reaches R2 directly

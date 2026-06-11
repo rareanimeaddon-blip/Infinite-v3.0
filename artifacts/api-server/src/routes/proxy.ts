@@ -198,8 +198,32 @@ async function reExtractFromHubCloud(landingPageUrl: string): Promise<string | n
             return loc;
           }
         } else {
-          logger.info({ link: link.slice(0, 80) }, "Proxy: hubcloud.cx re-extraction");
-          return link;
+          // gpdl.hubcloud.cx → workers.dev → gamerxyt.com/dl.php?link=VIDEO_URL (200 HTML)
+          // Follow ALL redirects; the actual video URL is in the `link=` query param
+          // of the final dl.php URL.
+          try {
+            const cx = await fetch(link, {
+              headers: { "User-Agent": UPSTREAM_UA },
+              redirect: "follow",
+              signal: AbortSignal.timeout(15_000),
+            });
+            const finalUrl = cx.url;
+            try {
+              const u = new URL(finalUrl);
+              const videoLink = u.searchParams.get("link");
+              if (videoLink && videoLink.startsWith("http")) {
+                logger.info({ videoLink: videoLink.slice(0, 80) }, "Proxy: hubcloud.cx re-extraction → video URL from dl.php chain");
+                return videoLink;
+              }
+            } catch { /* invalid URL */ }
+            if (finalUrl && finalUrl.startsWith("http") && !/\.php(\?|$)/.test(finalUrl)) {
+              logger.info({ finalUrl: finalUrl.slice(0, 80) }, "Proxy: hubcloud.cx re-extraction → final redirect URL");
+              return finalUrl;
+            }
+          } catch (cxErr) {
+            logger.warn({ err: cxErr }, "Proxy: hubcloud.cx chain follow failed");
+          }
+          logger.warn({ link: link.slice(0, 80) }, "Proxy: hubcloud.cx chain unresolved — skipping");
         }
       } catch { /* ignore, try next */ }
     }
@@ -257,8 +281,11 @@ async function refreshFromDownloadPage(downloadPageUrl: string): Promise<string 
     if (!pageRes.ok) return null;
     const html = await pageRes.text();
 
-    // Priority 1: BuzzServer button → /download redirect → buzz CDN URL
     const anchors = [...html.matchAll(/<a\b[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi)];
+
+    // Priority 1: BuzzServer button → /download → CDN URL
+    // Old BuzzServer: hx-redirect / location header.
+    // New BuzzServer (2025-06+): 200 HTML body with id="download" href.
     for (const [, rawHref, inner] of anchors) {
       if (!rawHref) continue;
       const text = inner.replace(/<[^>]+>/g, "").toLowerCase().trim();
@@ -269,14 +296,57 @@ async function refreshFromDownloadPage(downloadPageUrl: string): Promise<string 
         const bRes = await fetch(`${link}/download`, {
           headers: { "User-Agent": UPSTREAM_UA, "Referer": downloadPageUrl },
           redirect: "manual",
-          signal: AbortSignal.timeout(8_000),
+          signal: AbortSignal.timeout(12_000),
         });
         const loc = bRes.headers.get("hx-redirect") || bRes.headers.get("location") || "";
-        if (loc) return loc;
+        if (loc && loc.startsWith("http")) return loc;
+        if (bRes.status === 200) {
+          const bHtml = await bRes.text();
+          const m = /id="download"[^>]*\shref="([^"]+)"/i.exec(bHtml) ||
+                    /href="([^"]+)"[^>]*\sid="download"/i.exec(bHtml);
+          if (m?.[1]) {
+            const cdnUrl = m[1].replace(/&amp;/gi, "&");
+            if (cdnUrl.startsWith("http")) return cdnUrl;
+          }
+        }
       } catch { /* ignore, fall through */ }
     }
 
-    // Priority 2-4: signed URLs — prefer buzz > non-R2 > R2
+    // Priority 2: 10Gbps / hubcloud.cx button — follow chain to video URL
+    for (const [, rawHref, inner] of anchors) {
+      if (!rawHref) continue;
+      const text = inner.replace(/<[^>]+>/g, "").toLowerCase().trim();
+      const link = rawHref.replace(/&amp;/gi, "&");
+      if (!link.startsWith("http")) continue;
+      if (!text.includes("10gbps") && !link.includes("hubcloud.cx")) continue;
+      try {
+        if (link.includes("hubcloud.cx")) {
+          const cx = await fetch(link, {
+            headers: { "User-Agent": UPSTREAM_UA },
+            redirect: "follow",
+            signal: AbortSignal.timeout(15_000),
+          });
+          const finalUrl = cx.url;
+          try {
+            const u = new URL(finalUrl);
+            const videoLink = u.searchParams.get("link");
+            if (videoLink && videoLink.startsWith("http")) return videoLink;
+          } catch { /* invalid URL */ }
+          if (finalUrl && finalUrl.startsWith("http") && !/\.php(\?|$)/.test(finalUrl)) return finalUrl;
+        } else {
+          const r = await fetch(link, {
+            headers: { "User-Agent": UPSTREAM_UA },
+            redirect: "manual",
+            signal: AbortSignal.timeout(8_000),
+          });
+          const loc = r.headers.get("location") ?? "";
+          if (loc.includes("link=")) return loc.substring(loc.indexOf("link=") + 5);
+          if (loc && loc.startsWith("http")) return loc;
+        }
+      } catch { /* ignore, try next */ }
+    }
+
+    // Priority 3-5: signed URLs — prefer buzz > non-R2 > R2
     const signedUrls = [...html.matchAll(/href="(https?:\/\/[^"]{10,}[?&](?:amp;)?(?:token|Expires)=\d{9,12}[^"]*)"/gi)]
       .map(m => m[1]!.replace(/&amp;/gi, "&"));
     if (signedUrls.length > 0) {

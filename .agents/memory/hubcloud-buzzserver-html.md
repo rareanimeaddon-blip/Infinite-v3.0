@@ -14,8 +14,12 @@ Around 2025-06, BuzzServer changed its `/download` endpoint response:
 The old `getNoRedirect` approach discarded the response body, so it always saw empty headers and logged "no redirect found" — resulting in no stream being added.
 
 ## How to apply
-In `extractBuzzServer` (hubcloud.ts) and the BuzzServer section of `reExtractFromHubCloud` (proxy.ts):
+In `extractBuzzServer` (hubcloud.ts), Priority 1 in `reExtractFromHubCloud` (proxy.ts), and Priority 1 in `refreshFromDownloadPage` (proxy.ts):
 1. Use `fetch` with `redirect: "manual"` (not `getNoRedirect`) to access both headers AND body.
 2. First check `hx-redirect` / `location` headers (old path).
 3. If status is 200, read body and regex-match `id="download"` href (new path).
-4. Only push/return a URL if it starts with "http".
+4. Regex: `/id="download"[^>]*\shref="([^"]+)"/i` OR `/href="([^"]+)"[^>]*\sid="download"/i`
+5. Only push/return a URL if it starts with "http".
+
+## Note on current download pages
+As of 2025-06, HubCloud pages served via `gamerxyt.com/hubcloud.php?...` do NOT have BuzzServer buttons. BuzzServer handling is still needed for older pages that may still be served from different HubCloud instances.
