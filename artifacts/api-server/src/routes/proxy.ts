@@ -1915,20 +1915,106 @@ async function computeRelayM3u8(hash: string, playerCdn: string, proxyBase: stri
     }
   }
 
+  // For CDN multi-quality masters (isVariant=false): probe the first segment of
+  // the first video variant to get the PMT PID.  We need it to route every
+  // video-variant segment through /as-va, which patches the PMT to remove the
+  // audio PID declaration and drops any audio TS packets.
+  //
+  // Why this matters for LG TV WebOS:
+  //   The CDN video variants have PMT entries that declare audio PID 256 (Hindi)
+  //   even though the TS packets for that PID are absent.  When the HLS master
+  //   also declares an external AUDIO= group, LG TV's GStreamer pipeline finds
+  //   both the PMT-promised audio AND the external rendition audio and tries to
+  //   sync them.  The resulting double-audio condition stalls the video decoder
+  //   (classic "video frozen, audio plays" symptom).  Stripping the PMT audio
+  //   entry makes the video TS truly video-only; LG TV then cleanly uses the
+  //   external CDN audio renditions with no conflict.
+  let cdnPmtPid = -1;
+  if (!isVariant) {
+    const masterLines = text.split("\n");
+    let firstVariantAbsUrl: string | undefined;
+    for (let i = 0; i < masterLines.length - 1; i++) {
+      const t = masterLines[i].trim();
+      if (t.startsWith("#EXT-X-STREAM-INF")) {
+        const nextUrl = masterLines[i + 1]?.trim();
+        if (nextUrl && !nextUrl.startsWith("#")) {
+          firstVariantAbsUrl = nextUrl.startsWith("http") ? nextUrl
+            : nextUrl.startsWith("/") ? parsed.origin + nextUrl
+            : segBase + nextUrl;
+          break;
+        }
+      }
+    }
+    if (firstVariantAbsUrl) {
+      try {
+        const varResp = await fetch(firstVariantAbsUrl, {
+          headers: { "User-Agent": AS_CDN_UA, "Referer": playerUrl, "Origin": playerCdn, ...AS_BROWSER_EXTRA },
+          signal: AbortSignal.timeout(10_000),
+          redirect: "follow",
+        });
+        if (varResp.ok) {
+          const varText = await varResp.text();
+          const varParsed = new URL(firstVariantAbsUrl);
+          const varSegBase = varParsed.origin + varParsed.pathname.replace(/[^/]+$/, "");
+          const firstSegRel = varText.split("\n").find(l => { const t = l.trim(); return t && !t.startsWith("#"); });
+          if (firstSegRel) {
+            const firstSegUrl = firstSegRel.trim().startsWith("http") ? firstSegRel.trim()
+              : firstSegRel.trim().startsWith("/") ? varParsed.origin + firstSegRel.trim()
+              : varSegBase + firstSegRel.trim();
+            const segResp = await fetch(firstSegUrl, {
+              headers: {
+                "User-Agent": AS_CDN_UA, "Referer": playerUrl, "Origin": playerCdn,
+                "Range": "bytes=0-7519",
+                ...AS_BROWSER_EXTRA,
+              },
+              signal: AbortSignal.timeout(8_000),
+              redirect: "follow",
+            });
+            if (segResp.ok || segResp.status === 206) {
+              const buf = Buffer.from(await segResp.arrayBuffer());
+              const probe = probeAudioTracks(buf);
+              cdnPmtPid = probe.pmtPid;
+              logger.info(
+                { hash, pmtPid: cdnPmtPid, tracks: probe.tracks.map(t => `${t.name}(${t.pid})`) },
+                "AnimeSalt relay: CDN master segment probe"
+              );
+            }
+          }
+        }
+      } catch (err) {
+        logger.warn({ hash, err }, "AnimeSalt relay: CDN master probe failed (non-fatal)");
+      }
+    }
+  }
+
   const toAbsUrl = (rel: string): string => {
     if (rel.startsWith("http")) return rel;
     if (rel.startsWith("/")) return parsed.origin + rel;
     return segBase + rel;
   };
 
-  // noAudioProbe=1 tells the /m3u8 handler to skip the TS audio-probe for
-  // every playlist URL we generate here.  The outer master already defines the
-  // full audio/video structure; re-running the probe inside the handler would
-  // replace a variant playlist with a synthetic master, breaking LG TV playback.
-  const proxyUrl = (absUrl: string, isPlaylist: boolean): string =>
-    isPlaylist
-      ? `${proxyBase}/m3u8?url=${encodeURIComponent(absUrl)}&referer=${refEnc}&origin=${orgEnc}&noAudioProbe=1`
-      : `${proxyBase}/seg?u=${encodeURIComponent(absUrl)}&ref=${refEnc}&org=${orgEnc}`;
+  // proxyUrl builds the appropriate proxy URL for a CDN URL.
+  //
+  // For video quality variant playlist URLs (isVideoVariant=true) when we have
+  // a valid PMT PID from the probe above, we add audiopid+pmtpid so the /m3u8
+  // handler sets doAudioFilter=true and routes every segment through /as-va.
+  // /as-va patches the PMT to remove the audio PID entry and drops audio TS
+  // packets, giving LG TV a truly video-only TS with no PMT audio promise.
+  // audiopid=1 is a dummy value (>0 satisfies doAudioFilter; /as-va ignores it).
+  //
+  // noAudioProbe=1 on every playlist URL prevents the /m3u8 handler from
+  // running its own TS audio probe (which could replace a variant playlist
+  // with an inner synthetic master, nesting HLS levels unexpectedly).
+  const proxyUrl = (absUrl: string, isPlaylist: boolean, isVideoVariant = false): string => {
+    if (!isPlaylist) {
+      return `${proxyBase}/seg?u=${encodeURIComponent(absUrl)}&ref=${refEnc}&org=${orgEnc}`;
+    }
+    const base = `${proxyBase}/m3u8?url=${encodeURIComponent(absUrl)}&referer=${refEnc}&origin=${orgEnc}&noAudioProbe=1`;
+    if (isVideoVariant && !isVariant && cdnPmtPid > 0) {
+      return `${base}&audiopid=1&pmtpid=${cdnPmtPid}`;
+    }
+    return base;
+  };
 
   let nextLineIsVariant = false;
   const rewritten = text.split("\n").map((line) => {
@@ -1936,7 +2022,7 @@ async function computeRelayM3u8(hash: string, playerCdn: string, proxyBase: stri
     if (trimmed.startsWith("#EXT-X-MEDIA") && trimmed.includes('URI="')) {
       nextLineIsVariant = false;
       return line.replace(/URI="([^"]+)"/g, (_m, uri: string) =>
-        `URI="${proxyUrl(toAbsUrl(uri), true)}"`
+        `URI="${proxyUrl(toAbsUrl(uri), true, false)}"`
       );
     }
     if (trimmed.startsWith("#EXT-X-KEY") && trimmed.includes('URI="')) {
@@ -1959,37 +2045,33 @@ async function computeRelayM3u8(hash: string, playerCdn: string, proxyBase: stri
     if (!trimmed || trimmed.startsWith("#")) return line;
     const absUrl = toAbsUrl(trimmed);
     const isPlaylist = nextLineIsVariant || /\.m3u8/i.test(absUrl);
+    const isVideoVar = nextLineIsVariant;
     nextLineIsVariant = false;
-    return proxyUrl(absUrl, isPlaylist);
+    return proxyUrl(absUrl, isPlaylist, isVideoVar);
   }).join("\n");
 
-  // LG TV WebOS cannot reliably play a stream where the video TS is already
-  // muxed (contains an audio PID) AND the HLS master also declares an external
-  // AUDIO= group.  Having two audio sources (muxed + external rendition) causes
-  // the video renderer to freeze while audio plays from the external track.
+  // For master playlists that have real #EXT-X-MEDIA:TYPE=AUDIO renditions,
+  // ensure Hindi is listed FIRST and has DEFAULT=YES.
   //
-  // Fix: strip ALL #EXT-X-MEDIA:TYPE=AUDIO lines and the AUDIO="..." attribute
-  // from every #EXT-X-STREAM-INF so LG TV only sees a plain multi-quality
-  // master.  The muxed Hindi audio PID already in the video TS plays without
-  // any configuration needed.
-  //
-  // Language selection is preserved in the isVariant=true synthetic-master
-  // path below, which routes video through /as-va (audio-stripped TS) and
-  // audio through /as-audio-pl (properly demuxed per-language segments).
-  const rewrittenStripped = rewritten
-    .split("\n")
-    .filter(l => {
-      const t = l.trim();
-      return !(t.startsWith("#EXT-X-MEDIA") && t.includes("TYPE=AUDIO"));
-    })
-    .map(l =>
-      l.trim().startsWith("#EXT-X-STREAM-INF")
-        ? l.replace(/,?\s*AUDIO="[^"]*"/, "")
-        : l
-    )
-    .join("\n");
-
-  logger.info({ hash }, "AnimeSalt relay: stripped CDN audio renditions for LG TV muxed-audio compat");
+  // If the CDN master probe failed (cdnPmtPid <= 0) we cannot route video
+  // segments through /as-va, so the PMT still declares audio.  In that case
+  // fall back to stripping the external audio group entirely — LG TV then plays
+  // the PMT-promised (but empty) audio from the video TS silently, which is
+  // better than the double-audio freeze.
+  let withHindiFirst: string;
+  if (!isVariant && cdnPmtPid <= 0) {
+    withHindiFirst = rewritten
+      .split("\n")
+      .filter(l => !(l.trim().startsWith("#EXT-X-MEDIA") && l.includes("TYPE=AUDIO")))
+      .map(l => l.trim().startsWith("#EXT-X-STREAM-INF") ? l.replace(/,?\s*AUDIO="[^"]*"/, "") : l)
+      .join("\n");
+    logger.warn({ hash }, "AnimeSalt relay: CDN master probe failed — stripped audio renditions as fallback");
+  } else {
+    withHindiFirst = putHindiFirstInMaster(rewritten);
+    if (withHindiFirst !== rewritten) {
+      logger.info({ hash }, "AnimeSalt relay: reordered audio renditions — Hindi first, DEFAULT=YES");
+    }
+  }
 
   // If we're wrapping a CDN variant and detected multiple audio tracks,
   // synthesise a proper HLS master playlist with #EXT-X-MEDIA:TYPE=AUDIO
@@ -2045,7 +2127,7 @@ async function computeRelayM3u8(hash: string, playerCdn: string, proxyBase: stri
     ].join("\n");
   }
 
-  return rewrittenStripped;
+  return withHindiFirst;
 }
 
 // Returns a promise that resolves to the rewritten m3u8, using the cache and
