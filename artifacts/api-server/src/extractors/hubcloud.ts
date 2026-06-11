@@ -155,15 +155,22 @@ export async function extractHubCloud(
           behaviorHints: { notWebReady: false },
         });
       } else if (link.includes("r2.dev")) {
-        // R2 direct link — only serve if piped through our proxy (private buckets need this)
-        streams.push({
-          name: `${srcName} [Direct R2]`,
-          title: `Direct ${labelExtras}`,
-          url: link,
-          type: "mp4",
-          headers: bucketHeaders,
-          behaviorHints: { notWebReady: false },
-        });
+        // Plain pub-*.r2.dev private bucket URLs (no presigning params) are
+        // inaccessible — "This bucket cannot be viewed" 403 for ALL requests.
+        // Only add if presigned (has X-Amz-Signature / token / Expires).
+        const isPresigned = /[?&](X-Amz-Signature|token|Expires)=/i.test(link);
+        if (isPresigned) {
+          streams.push({
+            name: `${srcName} [Direct R2]`,
+            title: `Direct ${labelExtras}`,
+            url: link,
+            type: "mp4",
+            headers: bucketHeaders,
+            behaviorHints: { notWebReady: false },
+          });
+        } else {
+          logger.debug({ link }, `${TAG}: skipping plain R2 private bucket URL`);
+        }
       } else if (text.includes("v-cloud") || text.includes("vcloud") || text.includes("v cloud")) {
         streams.push({
           name: `${srcName} [V-Cloud]`,

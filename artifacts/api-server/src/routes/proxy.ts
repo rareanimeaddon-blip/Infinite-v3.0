@@ -148,20 +148,72 @@ async function reExtractFromHubCloud(landingPageUrl: string): Promise<string | n
       }
     }
 
-    // Priority 2-4 — signed URLs already present in the page HTML
+    // Priority 2: 10Gbps / hubcloud.cx button → follow redirect to get link= param
+    for (const [, rawHref, innerHtml] of allAnchors) {
+      if (!rawHref) continue;
+      const text = innerHtml.replace(/<[^>]+>/g, "").toLowerCase().trim();
+      const link = rawHref.replace(/&amp;/gi, "&").replace(/\/$/, "");
+      if (!link.startsWith("http")) continue;
+      if (!text.includes("10gbps") && !link.includes("hubcloud.cx")) continue;
+      try {
+        if (!link.includes("hubcloud.cx")) {
+          const r = await fetch(link, {
+            headers: { "User-Agent": UPSTREAM_UA },
+            redirect: "manual",
+            signal: AbortSignal.timeout(8_000),
+          });
+          const loc = r.headers.get("location") ?? "";
+          if (loc.includes("link=")) {
+            const extracted = loc.substring(loc.indexOf("link=") + 5);
+            logger.info({ extracted: extracted.slice(0, 80) }, "Proxy: 10Gbps re-extraction → CDN URL");
+            return extracted;
+          }
+          if (loc && loc.startsWith("http") && !/pub-[0-9a-f]+\.r2\.dev\//i.test(loc)) {
+            logger.info({ loc: loc.slice(0, 80) }, "Proxy: 10Gbps re-extraction → redirect URL");
+            return loc;
+          }
+        } else {
+          logger.info({ link: link.slice(0, 80) }, "Proxy: hubcloud.cx re-extraction");
+          return link;
+        }
+      } catch { /* ignore, try next */ }
+    }
+
+    // Priority 3: ZipDisk / Cloudflare workers.dev button (non-R2)
+    for (const [, rawHref, innerHtml] of allAnchors) {
+      if (!rawHref) continue;
+      const text = innerHtml.replace(/<[^>]+>/g, "").toLowerCase().trim();
+      const link = rawHref.replace(/&amp;/gi, "&");
+      if (!link.startsWith("http")) continue;
+      if ((text.includes("zipdisk") || link.includes("workers.dev")) && !/pub-[0-9a-f]+\.r2\.dev\//i.test(link)) {
+        logger.info({ link: link.slice(0, 80) }, "Proxy: ZipDisk/worker re-extraction");
+        return link;
+      }
+    }
+
+    // Priority 4: signed URLs in page HTML — prefer buzz > non-R2 > R2
     const signedUrls = [...dlHtml.matchAll(/href="(https?:\/\/[^"]{10,}[?&](?:amp;)?(?:token|Expires)=\d{9,12}[^"]*)"/gi)]
       .map(m => m[1]!.replace(/&amp;/gi, "&"));
     if (signedUrls.length > 0) {
       const buzzUrl  = signedUrls.find(u => /hub\.[^.]+\.buzz\//i.test(u));
       const nonR2Url = signedUrls.find(u => !/pub-[0-9a-f]+\.r2\.dev\//i.test(u));
-      // Prefer buzz > non-R2 > R2 (R2 private buckets return 403 regardless)
       const chosen = buzzUrl ?? nonR2Url ?? signedUrls[0]!;
       logger.info(
-        { chosen: chosen.slice(0, 80), total: signedUrls.length, preferredBuzz: !!buzzUrl, isR2: /pub-[0-9a-f]+\.r2\.dev\//i.test(chosen) },
-        "Proxy: picked CDN URL from download page signed URLs",
+        { chosen: chosen.slice(0, 80), total: signedUrls.length, isR2: /pub-[0-9a-f]+\.r2\.dev\//i.test(chosen) },
+        "Proxy: picked CDN URL from signed URLs",
       );
       return chosen;
     }
+
+    // Priority 5: any non-R2 direct video link (.mp4 / large file hint)
+    const anyLinks = [...dlHtml.matchAll(/href="(https?:\/\/[^"]+\.(?:mp4|mkv|avi|mov)[^"]*)"/gi)]
+      .map(m => m[1]!.replace(/&amp;/gi, "&"))
+      .filter(u => !/pub-[0-9a-f]+\.r2\.dev\//i.test(u));
+    if (anyLinks.length > 0) {
+      logger.info({ link: anyLinks[0]!.slice(0, 80) }, "Proxy: direct video link fallback");
+      return anyLinks[0]!;
+    }
+
     logger.warn({ url: downloadPageUrl.slice(0, 80) }, "Proxy: no CDN URL found on HubCloud download page");
     return null;
   } catch (err) {
@@ -954,61 +1006,62 @@ router.get("/proxy", async (req, res) => {
   const isMpd = targetUrl.includes(".mpd") || targetUrl.includes("manifest");
 
   if (!isMpd) {
-    // ── R2 signed-URL proactive refresh ──────────────────────────────────────
-    // HubCloud (used by HDHub4U / 4KHDHub) serves video files from Cloudflare
-    // R2 (?token=<epoch>) or S3/B2 (?Expires=<epoch>) with short-lived tokens.
-    // By the time Stremio shows the stream list and the user taps to play, the
-    // token is usually expired → CDN returns 403.
+    // ── Proactive re-extraction for HubCloud CDN URLs ─────────────────────────
+    // HubCloud serves content via short-lived tokens (FSL/S3/B2/buzz) or private
+    // Cloudflare R2 buckets (pub-*.r2.dev — "bucket cannot be viewed" 403).
     //
-    // Strategy (in preference order):
-    //   1. If lp param present: re-run full HubCloud 2-step extraction from the
-    //      stable landing page.  This always yields fresh session + CDN tokens.
-    //   2. Else fall back to re-fetching the download page stored in ref.
+    // Two cases require proactive re-extraction before even attempting to pipe:
     //
-    // Only activate when the target URL carries a 9-11 digit numeric token AND
-    // it has expired or is within 60 s of expiry.
-    const r2TokenMatch = /[?&](?:token|Expires)=(\d{9,11})(?:[&#]|$)/.exec(targetUrl);
-    if (r2TokenMatch && (landingPage || extraHeaders?.referer)) {
-      const tokenTs = parseInt(r2TokenMatch[1]!);
-      const nowTs   = Math.floor(Date.now() / 1000);
-      if (tokenTs <= nowTs + 60) {
-        try {
-          let freshUrl: string | null = null;
+    //   Case A — Plain R2 private bucket URL (no auth params):
+    //     pub-*.r2.dev URLs without X-Amz-Signature / token are inaccessible.
+    //     Going straight to re-extraction avoids a guaranteed 403.
+    //
+    //   Case B — Expired short-lived numeric token (epoch 9-11 digits):
+    //     Token has expired or expires within 60 s → re-extract before piping.
+    //
+    // In both cases, pipe the fresh URL through our proxy (never redirect to R2).
 
-          if (landingPage) {
-            freshUrl = await reExtractFromHubCloud(landingPage);
-            if (freshUrl) {
-              logger.info(
-                { oldExpiry: tokenTs, newUrl: freshUrl.slice(0, 100) },
-                "Proxy: proactively re-extracted fresh CDN URL from HubCloud landing page",
-              );
-            }
-          }
+    const isPlainR2 = /pub-[0-9a-f]{10,}\.r2\.dev\//i.test(targetUrl) &&
+                      !/[?&](X-Amz-Signature|token|Expires)=/i.test(targetUrl);
 
-          if (!freshUrl && extraHeaders?.referer) {
-            freshUrl = await refreshFromDownloadPage(extraHeaders.referer);
-            if (freshUrl) {
-              logger.info(
-                { oldExpiry: tokenTs, newUrl: freshUrl.slice(0, 100) },
-                "Proxy: proactively refreshed expired signed URL via HubCloud download page",
-              );
-            }
-          }
+    const numericTokenMatch = /[?&](?:token|Expires)=(\d{9,11})(?:[&#]|$)/.exec(targetUrl);
+    const tokenExpired = numericTokenMatch
+      ? parseInt(numericTokenMatch[1]!) <= Math.floor(Date.now() / 1000) + 60
+      : false;
 
+    if ((isPlainR2 || tokenExpired) && (landingPage || extraHeaders?.referer)) {
+      logger.info(
+        { isPlainR2, tokenExpired, url: targetUrl.slice(0, 100) },
+        "Proxy: proactive re-extraction triggered",
+      );
+      try {
+        let freshUrl: string | null = null;
+
+        if (landingPage) {
+          freshUrl = await reExtractFromHubCloud(landingPage);
           if (freshUrl) {
-            // Always pipe through our proxy (never redirect).
-            // R2 private buckets ("bucket not viewable") return 403 for ANY
-            // request to pub-*.r2.dev — including 302 redirects — because the
-            // bucket requires custom-domain access.  Proxying the signed URL
-            // directly works as long as the token hasn't yet expired, which it
-            // hasn't since we just extracted it.  buzz CDN URLs tolerate the
-            // extra proxy latency easily (long token grace period).
-            logger.info({ freshUrl: freshUrl.slice(0, 100) }, "Proxy: proactively updated targetUrl with fresh CDN URL");
-            targetUrl = freshUrl;
+            logger.info({ newUrl: freshUrl.slice(0, 100) }, "Proxy: proactively re-extracted fresh CDN URL");
           }
-        } catch (err) {
-          logger.warn({ err }, "Proxy: proactive refresh failed — will retry reactively on 403");
         }
+
+        if (!freshUrl && extraHeaders?.referer) {
+          freshUrl = await refreshFromDownloadPage(extraHeaders.referer);
+          if (freshUrl) {
+            logger.info({ newUrl: freshUrl.slice(0, 100) }, "Proxy: proactively refreshed via download page");
+          }
+        }
+
+        if (freshUrl) {
+          logger.info({ freshUrl: freshUrl.slice(0, 100) }, "Proxy: using fresh CDN URL");
+          targetUrl = freshUrl;
+        } else if (isPlainR2) {
+          // Plain R2 URL and re-extraction failed — nothing will work, give up early.
+          logger.warn({ lp: landingPage?.slice(0, 80) }, "Proxy: plain R2 URL and re-extraction failed — returning 503");
+          if (!res.headersSent) res.status(503).json({ error: "Stream temporarily unavailable — CDN is private R2. Try again." });
+          return;
+        }
+      } catch (err) {
+        logger.warn({ err }, "Proxy: proactive refresh failed — will retry reactively on 403");
       }
     }
 
