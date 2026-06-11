@@ -1262,7 +1262,8 @@ function filterToSingleVariantProxy(m3u8: string): string {
 // /api/m3u8?url=<enc>&referer=<enc>&origin=<enc>
 // referer and origin are optional — defaults keep AnimeSalt backward-compat.
 router.get("/m3u8", async (req: Request, res: Response) => {
-  const { url, referer: refParam, origin: originParam, audiopid: audiopidParam, pmtpid: pmtpidParam } =
+  const { url, referer: refParam, origin: originParam, audiopid: audiopidParam, pmtpid: pmtpidParam,
+          noAudioProbe: noAudioProbeParam } =
     req.query as Record<string, string | undefined>;
   if (!url) { res.status(400).json({ error: "Missing url" }); return; }
 
@@ -1273,6 +1274,14 @@ router.get("/m3u8", async (req: Request, res: Response) => {
   const filterPmtPidNum   = pmtpidParam   ? parseInt(pmtpidParam, 10)   : undefined;
   const doAudioFilter = filterAudioPidNum !== undefined && isFinite(filterAudioPidNum) &&
                         filterPmtPidNum   !== undefined && isFinite(filterPmtPidNum);
+
+  // noAudioProbe=1 is set by computeRelayM3u8 on every playlist URL it generates
+  // so that the TS audio-probe inside this handler does NOT fire when the player
+  // fetches a variant/rendition that is already part of a properly-structured
+  // outer master.  Without this guard the probe can return a synthetic inner
+  // master in place of the expected segment playlist, which causes LG TV's player
+  // to receive a master where it expects a variant → video freeze.
+  const noAudioProbe = noAudioProbeParam === "1";
 
   let targetUrl: string;
   try {
@@ -1381,7 +1390,7 @@ router.get("/m3u8", async (req: Request, res: Response) => {
     // Only runs for AnimeSalt CDN hostnames AND when the caller did not already
     // request audio filtering (doAudioFilter means we're already serving filtered
     // segments — no need for another synthetic master layer).
-    if (isVariantPlaylist && /as-cdn\d*\.top/i.test(parsed.hostname) && !doAudioFilter) {
+    if (isVariantPlaylist && /as-cdn\d*\.top/i.test(parsed.hostname) && !doAudioFilter && !noAudioProbe) {
       const firstSegRel = playlistText.split("\n").find(l => { const t = l.trim(); return t && !t.startsWith("#"); });
       if (firstSegRel) {
         const firstSegUrl = firstSegRel.trim().startsWith("http") ? firstSegRel.trim()
@@ -1912,9 +1921,13 @@ async function computeRelayM3u8(hash: string, playerCdn: string, proxyBase: stri
     return segBase + rel;
   };
 
+  // noAudioProbe=1 tells the /m3u8 handler to skip the TS audio-probe for
+  // every playlist URL we generate here.  The outer master already defines the
+  // full audio/video structure; re-running the probe inside the handler would
+  // replace a variant playlist with a synthetic master, breaking LG TV playback.
   const proxyUrl = (absUrl: string, isPlaylist: boolean): string =>
     isPlaylist
-      ? `${proxyBase}/m3u8?url=${encodeURIComponent(absUrl)}&referer=${refEnc}&origin=${orgEnc}`
+      ? `${proxyBase}/m3u8?url=${encodeURIComponent(absUrl)}&referer=${refEnc}&origin=${orgEnc}&noAudioProbe=1`
       : `${proxyBase}/seg?u=${encodeURIComponent(absUrl)}&ref=${refEnc}&org=${orgEnc}`;
 
   let nextLineIsVariant = false;
@@ -1950,20 +1963,33 @@ async function computeRelayM3u8(hash: string, playerCdn: string, proxyBase: stri
     return proxyUrl(absUrl, isPlaylist);
   }).join("\n");
 
-  // For master playlists that have real #EXT-X-MEDIA:TYPE=AUDIO renditions,
-  // ensure Hindi is listed FIRST and has DEFAULT=YES.
+  // LG TV WebOS cannot reliably play a stream where the video TS is already
+  // muxed (contains an audio PID) AND the HLS master also declares an external
+  // AUDIO= group.  Having two audio sources (muxed + external rendition) causes
+  // the video renderer to freeze while audio plays from the external track.
   //
-  // LG TV (and many TV players) select the audio rendition either by DEFAULT=YES
-  // or simply by playing the first listed rendition.  The AnimeSalt CDN master
-  // has all three tracks (tel/tam/hin) with DEFAULT=NO, so whichever comes first
-  // (typically Telugu) is what LG TV plays.  Moving Hindi first + setting
-  // DEFAULT=YES means LG TV plays Hindi out of the box regardless of its
-  // selection strategy.  Android users can still switch via the normal track
-  // selector — all three renditions remain in the playlist.
-  const withHindiFirst = putHindiFirstInMaster(rewritten);
-  if (withHindiFirst !== rewritten) {
-    logger.info({ hash }, "AnimeSalt relay: reordered audio renditions — Hindi first, DEFAULT=YES");
-  }
+  // Fix: strip ALL #EXT-X-MEDIA:TYPE=AUDIO lines and the AUDIO="..." attribute
+  // from every #EXT-X-STREAM-INF so LG TV only sees a plain multi-quality
+  // master.  The muxed Hindi audio PID already in the video TS plays without
+  // any configuration needed.
+  //
+  // Language selection is preserved in the isVariant=true synthetic-master
+  // path below, which routes video through /as-va (audio-stripped TS) and
+  // audio through /as-audio-pl (properly demuxed per-language segments).
+  const rewrittenStripped = rewritten
+    .split("\n")
+    .filter(l => {
+      const t = l.trim();
+      return !(t.startsWith("#EXT-X-MEDIA") && t.includes("TYPE=AUDIO"));
+    })
+    .map(l =>
+      l.trim().startsWith("#EXT-X-STREAM-INF")
+        ? l.replace(/,?\s*AUDIO="[^"]*"/, "")
+        : l
+    )
+    .join("\n");
+
+  logger.info({ hash }, "AnimeSalt relay: stripped CDN audio renditions for LG TV muxed-audio compat");
 
   // If we're wrapping a CDN variant and detected multiple audio tracks,
   // synthesise a proper HLS master playlist with #EXT-X-MEDIA:TYPE=AUDIO
@@ -1992,7 +2018,7 @@ async function computeRelayM3u8(hash: string, playerCdn: string, proxyBase: stri
     // switch via the #EXT-X-MEDIA renditions below.
     const variantWithHindi =
       `${proxyBase}/m3u8?url=${encVariant}&referer=${refEnc}&origin=${orgEnc}` +
-      `&audiopid=${hindiTrack.pid}&pmtpid=${pmtStr}`;
+      `&audiopid=${hindiTrack.pid}&pmtpid=${pmtStr}&noAudioProbe=1`;
 
     const mediaLines = orderedTracks.map((t, i) => {
       const audioPlUrl =
@@ -2019,7 +2045,7 @@ async function computeRelayM3u8(hash: string, playerCdn: string, proxyBase: stri
     ].join("\n");
   }
 
-  return withHindiFirst;
+  return rewrittenStripped;
 }
 
 // Returns a promise that resolves to the rewritten m3u8, using the cache and

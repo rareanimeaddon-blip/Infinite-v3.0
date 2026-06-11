@@ -1,2 +1,3 @@
 - [RareAnime LG TV ABR fix](rareanime-lg-tv-abr.md) — LG WebOS "Error while decoding" after ~5s is caused by MPEG-TS ABR switching; fix is filterToSingleVariant() in rareanime-proxy.ts.
 - [AnimeSalt CDN VOD tag injection](animesalt-vod-tags.md) — CDN already sends #EXT-X-ENDLIST but omits #EXT-X-PLAYLIST-TYPE:VOD; inject before the rewriting loop, not after.
+- [AnimeSalt LG TV video freeze fix](animesalt-lg-tv-freeze.md) — muxed video TS + external AUDIO= group causes LG WebOS video renderer to freeze; fix is to strip CDN audio renditions from outer master.
