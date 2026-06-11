@@ -773,6 +773,49 @@ router.get("/proxy", async (req, res) => {
   const isMpd = targetUrl.includes(".mpd") || targetUrl.includes("manifest");
 
   if (!isMpd) {
+    // ── R2 signed-URL auto-refresh ────────────────────────────────────────────
+    // HubCloud (used by HDHub4U / 4KHDHub) serves video files from Cloudflare
+    // R2 with a Unix-timestamp token (?token=<epoch>) that expires in ~5-10
+    // minutes.  By the time Stremio shows the stream list and the user taps to
+    // play, the token is usually dead → CDN returns 403.
+    //
+    // The HubCloud *download page* URL (stored in our `ref` param) has a much
+    // longer-lived token; re-fetching it yields a fresh R2 signed URL.
+    // Only activate when:
+    //   • the target URL carries a 9-11 digit numeric token (Unix timestamp), AND
+    //   • the token has expired or is within 60 s of expiry, AND
+    //   • we have the download-page URL in the referer param.
+    const r2TokenMatch = /[?&]token=(\d{9,11})(?:[&#]|$)/.exec(targetUrl);
+    if (r2TokenMatch && extraHeaders?.referer) {
+      const tokenTs = parseInt(r2TokenMatch[1]!);
+      const nowTs   = Math.floor(Date.now() / 1000);
+      if (tokenTs <= nowTs + 60) {
+        try {
+          const pageRes = await fetch(extraHeaders.referer, {
+            headers: { "User-Agent": UPSTREAM_UA },
+            signal: AbortSignal.timeout(10_000),
+            redirect: "follow",
+          });
+          if (pageRes.ok) {
+            const html = await pageRes.text();
+            // Match any href that carries a fresh numeric token
+            const freshMatch = /href="(https?:\/\/[^"]{10,}[?&](?:amp;)?token=\d{9,11}[^"]*)"/i.exec(html);
+            if (freshMatch?.[1]) {
+              // HTML-unescape &amp; entities that browsers encode in href attributes
+              const freshUrl = freshMatch[1].replace(/&amp;/gi, "&");
+              logger.info(
+                { oldExpiry: tokenTs, newUrl: freshUrl.slice(0, 100) },
+                "Proxy: refreshed expired R2 token via HubCloud download page",
+              );
+              targetUrl = freshUrl;
+            }
+          }
+        } catch (err) {
+          logger.warn({ err }, "Proxy: R2 token refresh failed — falling back to original URL");
+        }
+      }
+    }
+
     try {
       await pipeUpstream(targetUrl, cookie, req, res, extraHeaders);
     } catch (err) {
