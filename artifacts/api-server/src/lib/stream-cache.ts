@@ -61,3 +61,26 @@ export function setStreamCache(
 export function streamCacheStats(): { size: number; maxEntries: number } {
   return { size: cache.size, maxEntries: MAX_ENTRIES };
 }
+
+// ─── Provider subtitle cache ──────────────────────────────────────────────────
+// Populated by the stream endpoint after mergeSubtitles() runs.
+// Consumed by the /subtitles/ resource endpoint so LG TV (which only uses
+// that endpoint, not the subtitles[] field in stream objects) also gets
+// the cross-provider subtitles (e.g. MovieBox SRTs, DooFlix subs, etc.).
+
+export interface ProviderSubEntry { url: string; lang: string; id: string }
+
+const subCache = new Map<string, { subs: ProviderSubEntry[]; expiresAt: number }>();
+const SUB_TTL_MS = 60 * 60 * 1000; // 1 h — same content won't change quickly
+
+export function setProviderSubtitles(imdbId: string, subs: ProviderSubEntry[]): void {
+  if (!imdbId.startsWith("tt") || !subs.length) return;
+  subCache.set(imdbId, { subs, expiresAt: Date.now() + SUB_TTL_MS });
+}
+
+export function getProviderSubtitles(imdbId: string): ProviderSubEntry[] {
+  const entry = subCache.get(imdbId);
+  if (!entry) return [];
+  if (Date.now() > entry.expiresAt) { subCache.delete(imdbId); return []; }
+  return entry.subs;
+}

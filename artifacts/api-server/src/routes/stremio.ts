@@ -70,6 +70,8 @@ import {
   streamCacheKey,
   streamCacheStats,
   TTL_MS_DEFAULT,
+  setProviderSubtitles,
+  getProviderSubtitles,
 } from "../lib/stream-cache.js";
 import type { Stream } from "../extractors/types.js";
 
@@ -1641,21 +1643,26 @@ router.get("/subtitles/:type/:id.json", async (req, res) => {
   }
 
   try {
-    const results = await searchSubtitles(
-      imdbId,
-      type === "series" ? season : null,
-      type === "series" ? episode : null,
-    );
+    // Provider subtitles: collected when stream endpoint ran (works for all Stremio clients)
+    // YIFYsubtitles: searched on demand (additional SRT sources)
+    const [providerSubs, yifyResults] = await Promise.all([
+      Promise.resolve(getProviderSubtitles(imdbId)),
+      searchSubtitles(
+        imdbId,
+        type === "series" ? season : null,
+        type === "series" ? episode : null,
+      ),
+    ]);
 
-    // Pick top 2 per language to avoid overwhelming the subtitle menu
-    const byLang = new Map<string, typeof results>();
-    for (const r of results) {
+    // Pick top 2 per language from YIFY to avoid overwhelming the subtitle menu
+    const byLang = new Map<string, typeof yifyResults>();
+    for (const r of yifyResults) {
       if (!byLang.has(r.langCode)) byLang.set(r.langCode, []);
       byLang.get(r.langCode)!.push(r);
     }
 
     const base = apiBase(req);
-    const subtitles = [...byLang.values()].flatMap((group) =>
+    const yifySubs = [...byLang.values()].flatMap((group) =>
       group.slice(0, 2).map((r, i) => ({
         id: `os-${r.fileId}-${i}`,
         url: `${base}/subtitle-proxy?url=${Buffer.from(r.downloadUrl).toString("base64url")}`,
@@ -1663,7 +1670,13 @@ router.get("/subtitles/:type/:id.json", async (req, res) => {
       })),
     );
 
-    logger.info({ imdbId, season, episode, count: subtitles.length }, "Stremio: subtitles");
+    // Provider subs first (from MovieBox, DooFlix, etc.), YIFY subs appended.
+    // De-duplicate by URL so the same sub doesn't appear twice.
+    const seenUrls = new Set(providerSubs.map((s) => s.url));
+    const uniqueYify = yifySubs.filter((s) => !seenUrls.has(s.url));
+    const subtitles = [...providerSubs, ...uniqueYify];
+
+    logger.info({ imdbId, season, episode, provider: providerSubs.length, yify: yifySubs.length, total: subtitles.length }, "Stremio: subtitles (LG TV)");
     res.json({ subtitles });
   } catch (err) {
     logger.error({ err, id }, "Stremio: subtitle error");
@@ -1808,6 +1821,10 @@ router.get("/stream/:type/:id.json", async (req, res) => {
       );
       logResolve({ imdbId, step: "done", status: combined.length ? "ok" : "fail", detail: `as=${asStreams.length} ra=${raStreams.length} ad=${adStreams.length} nm=${nmStreams.length} mb=${mbStreams.length} hm=${hmStreams.length} ct=${ctStreams.length} dm=${dmStreams.length} sf=${sfStreams.length} df=${dfStreams.length} hd=${hdStreams.length} fk=${fkStreams.length} total=${combined.length}` });
 
+      // Cache provider subtitles for LG TV (uses /subtitles/ endpoint, not stream.subtitles[])
+      const firstSubs = (combined[0]?.["subtitles"] as Array<{url:string;lang:string;id:string}> | undefined) ?? [];
+      setProviderSubtitles(imdbId, firstSubs);
+
       setStreamCache(ckey, combined, TTL_MS_DEFAULT);
       res.json({ streams: combined });
       return;
@@ -1888,6 +1905,12 @@ router.get("/stream/:type/:id.json", async (req, res) => {
         "Stremio: TMDB 12 providers aggregated",
       );
       logResolve({ imdbId: id, step: "done", status: combined.length ? "ok" : "fail", detail: `as=${asStreams.length} ra=${raStreams.length} ad=${adStreams.length} nm=${nmStreams.length} mb=${mbStreams.length} hm=${hmStreams.length} ct=${ctStreams.length} dm=${dmStreams.length} sf=${sfStreams.length} df=${dfStreams.length} hd=${hdStreams.length} fk=${fkStreams.length} total=${combined.length}` });
+
+      // Cache provider subtitles for LG TV using the resolved IMDB ID
+      if (meta.imdbId?.startsWith("tt")) {
+        const firstSubs2 = (combined[0]?.["subtitles"] as Array<{url:string;lang:string;id:string}> | undefined) ?? [];
+        setProviderSubtitles(meta.imdbId, firstSubs2);
+      }
 
       setStreamCache(ckey, combined, TTL_MS_DEFAULT);
       res.json({ streams: combined });
