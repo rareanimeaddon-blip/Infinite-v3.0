@@ -286,6 +286,8 @@ const PROVIDER_PATTERNS: Record<string, RegExp> = {
   dahmermovies: /DahmerMovies/i,
   hindmovies:   /HindMoviez/i,
   moviebox:     /MovieBox/i,
+  hdhub4u:      /HDHub4U/i,
+  fourkdhub:    /4KHDHub/i,
 };
 
 function countByProvider(streams: { name?: string }[]): Map<string, number> {
@@ -363,6 +365,8 @@ router.get("/debug/health", (_req, res) => {
     dahmermovies: { emoji: "💀",  label: "DahmerMovies",  types: "Movies · Series" },
     hindmovies:   { emoji: "🎞️", label: "HindMoviez",    types: "Movies · Series" },
     moviebox:     { emoji: "🍿",  label: "MovieBox",      types: "Movies · Series" },
+    hdhub4u:      { emoji: "📡",  label: "HDHub4U",       types: "Movies · Series" },
+    fourkdhub:    { emoji: "🔵",  label: "4KHDHub",       types: "Movies · Series" },
   };
 
   const cards = PROVIDER_LIST.map((p) => {

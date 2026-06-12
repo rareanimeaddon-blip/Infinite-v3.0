@@ -144,6 +144,24 @@ function serveLandingPage(req: express.Request, res: express.Response) {
       tags: ["Bollywood", "Hindi Dub", "480p–4K", "Series"],
       desc: "Bollywood, Hollywood & Hindi-dubbed movies and series in 480p, 720p, 1080p & 4K.",
     },
+    {
+      key: "hdhub4u",
+      name: "HDHub4U",
+      emoji: "📡",
+      color: "#f59e0b",
+      glow: "rgba(245,158,11,0.3)",
+      tags: ["1080p", "Hindi", "Dual Audio", "HubCloud"],
+      desc: "Hindi & Dual-audio movies and series resolved via HubCloud, PixelDrain & HdStream4u CDN.",
+    },
+    {
+      key: "fourkdhub",
+      name: "4KHDHub",
+      emoji: "🔵",
+      color: "#3b82f6",
+      glow: "rgba(59,130,246,0.3)",
+      tags: ["4K", "1080p", "Hindi", "Dual Audio"],
+      desc: "4K and 1080p Hindi & Dual-audio streams via HubCloud CDN with quality-aware extraction.",
+    },
   ];
 
   const providerCards = providers
@@ -187,7 +205,7 @@ function serveLandingPage(req: express.Request, res: express.Response) {
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<meta name="description" content="INFINITE STREAMS — 10 providers, one addon. AnimeSalt, RareAnime, AnimeDekho, NetMirror, MovieBox, HindMoviez, Castle TV, DahmerMovies, StreamFlix, DooFlix. Install in one click."/>
+<meta name="description" content="INFINITE STREAMS — 12 providers, one addon. AnimeSalt, RareAnime, AnimeDekho, NetMirror, MovieBox, HindMoviez, Castle TV, DahmerMovies, StreamFlix, DooFlix, HDHub4U, 4KHDHub. Install in one click."/>
 <title>INFINITE STREAMS — Stremio Addon</title>
 <link rel="preconnect" href="https://fonts.googleapis.com"/>
 <link href="https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,300..900;1,14..32,300..900&display=swap" rel="stylesheet"/>
