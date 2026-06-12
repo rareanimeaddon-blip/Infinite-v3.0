@@ -498,9 +498,11 @@ function hdhub4uStreamToStremio(
   entry: hdhub4u.StreamEntry,
   sourceName: string,
 ): Record<string, unknown> {
+  const server = entry.server ?? "HubCloud";
+  const sizePart = entry.size ? ` · 📁 ${entry.size}` : "";
   return {
-    name: `${sourceName}\n${entry.quality} | ${entry.language}`,
-    title: `${entry.quality} · ${entry.language}`,
+    name: `${sourceName}\n${entry.quality} | ${server}`,
+    title: `🔊 ${entry.language}${sizePart}`,
     url: entry.url,
     behaviorHints: { notWebReady: true },
   };

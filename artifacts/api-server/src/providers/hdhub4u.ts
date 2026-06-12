@@ -72,6 +72,8 @@ export interface StreamEntry {
   quality: string;
   language: string;
   label: string;
+  size?: string;
+  server?: string;
   season?: number;
   episode?: number;
 }
@@ -452,6 +454,7 @@ export async function extractStreams(
         quality: resolved.quality,
         language: languageHint,
         label: `${resolved.quality} [${resolved.host}]`,
+        server: resolved.host,
         season,
         episode,
       } as StreamEntry;

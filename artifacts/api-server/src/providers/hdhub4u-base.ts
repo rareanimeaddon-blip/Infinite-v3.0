@@ -126,13 +126,21 @@ export function extractQuality(text: string): string {
 }
 
 export function extractLanguage(text: string): string {
-  if (/dual[\s-]?audio|dual/i.test(text)) return "Dual Audio";
-  if (/multi[\s-]?audio|multi/i.test(text)) return "Multi Audio";
-  if (/hindi/i.test(text)) return "Hindi";
-  if (/tamil/i.test(text)) return "Tamil";
-  if (/telugu/i.test(text)) return "Telugu";
-  if (/punjabi/i.test(text)) return "Punjabi";
-  if (/english/i.test(text)) return "English";
+  if (/multi[\s-]?audio|multi[\s-]?lang/i.test(text)) return "Multi Audio";
+  if (/dual[\s-]?audio/i.test(text)) return "Dual Audio";
+
+  const found: string[] = [];
+  if (/hindi/i.test(text)) found.push("Hindi");
+  if (/english/i.test(text)) found.push("English");
+  if (/tamil/i.test(text)) found.push("Tamil");
+  if (/telugu/i.test(text)) found.push("Telugu");
+  if (/punjabi/i.test(text)) found.push("Punjabi");
+  if (/korean/i.test(text)) found.push("Korean");
+  if (/japanese/i.test(text)) found.push("Japanese");
+  if (/french/i.test(text)) found.push("French");
+
+  if (found.length > 1) return found.join(" + ");
+  if (found.length === 1) return found[0]!;
   return "Hindi";
 }
 

@@ -68,6 +68,8 @@ export interface StreamEntry {
   quality: string;
   language: string;
   label: string;
+  size?: string;
+  server?: string;
   season?: number;
   episode?: number;
 }
@@ -225,7 +227,7 @@ export async function extractStreams(
   const $ = await fetchHtml(pageUrl, { Referer: pageUrl });
   if (!$) return [];
 
-  const rawLinks: { url: string; label: string; quality: string; language: string }[] = [];
+  const rawLinks: { url: string; label: string; quality: string; language: string; size?: string }[] = [];
   const isSeries = season !== undefined;
   const seasonStr = isSeries ? `S${String(season).padStart(2, "0")}` : null;
 
@@ -246,19 +248,40 @@ export async function extractStreams(
     const badgeText = header.find(".badge, [class*=badge], [class*=tag]").map((_j, b) => $(b).text()).get().join(" ");
     const quality = extractQuality(headerTitle + " " + badgeText);
 
-    const languages: string[] = [];
-    header.find(".badge, [class*=badge], [class*=tag]").each((_j, b) => {
-      const t = $(b).text().trim();
-      if (/hindi|english|tamil|telugu|multi|dual|korean|japanese|french/i.test(t)) languages.push(t);
+    // Size: orange badge (#ea580c) e.g. "54.72 GB"
+    let size: string | undefined;
+    header.find(".badge").each((_j, b) => {
+      const style = $(b).attr("style") ?? "";
+      if (/ea580c/i.test(style)) {
+        const t = $(b).text().trim();
+        if (/\d+\.?\d*\s*(?:GB|MB|TB)/i.test(t)) size = t;
+      }
     });
-    const language = languages.length > 0 ? languages.join(", ") : extractLanguage(headerTitle + " " + pageUrl);
+
+    // Language: teal badge (#0d9488) e.g. "Hindi,English" — most accurate source
+    let language: string | undefined;
+    header.find(".badge").each((_j, b) => {
+      const style = $(b).attr("style") ?? "";
+      if (/0d9488/i.test(style)) {
+        const t = $(b).text().trim();
+        if (t) language = t.replace(/,\s*/g, " + ");
+      }
+    });
+    if (!language) {
+      const langs: string[] = [];
+      header.find(".badge, [class*=badge], [class*=tag]").each((_j, b) => {
+        const t = $(b).text().trim();
+        if (/hindi|english|tamil|telugu|multi|dual|korean|japanese|french/i.test(t)) langs.push(t);
+      });
+      language = langs.length > 0 ? langs.join(" + ") : extractLanguage(headerTitle + " " + pageUrl);
+    }
 
     $(dlItem).find("a[href]").each((_j, aEl) => {
       const href = $(aEl).attr("href") ?? "";
       const spanText = $(aEl).find("span").first().text().trim() || $(aEl).text().trim();
       if (!href.startsWith("http")) return;
       if (STREAM_HOST_PATTERN.test(href + " " + spanText)) {
-        rawLinks.push({ url: href, label: spanText || href, quality, language });
+        rawLinks.push({ url: href, label: spanText || href, quality, language, size });
       }
     });
   });
@@ -301,6 +324,8 @@ export async function extractStreams(
           quality: resolved.quality,
           language: link.language,
           label: `${resolved.host} | ${link.label}`.slice(0, 80),
+          size: link.size,
+          server: resolved.host,
           season,
           episode,
         };
