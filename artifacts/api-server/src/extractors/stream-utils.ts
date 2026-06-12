@@ -1,5 +1,5 @@
 const FILE_HOSTING_BLOCKLIST =
-  /gofile\.io|mega[0-9]*\.dp\.ua|megaup\.net|pandafiles\.com|clicknupload|desiupload\.co|uploadhub\.|indishare\.|gdflix\.|filescloud\.|4khdhub\.link|mega\.nz|drive\.google|dropbox\.com|mediafire\.com|zippyshare|filecrypt\.|uploadrar\.|rapidgator\.|nitroflare\.|turbobit\.|1fichier\.|alfafile\.|katfile\.|ddownload\.|rockfile\.|hitfile\.|worldbytez\./i;
+  /gofile\.io|mega[0-9]*\.dp\.ua|megaup\.net|pandafiles\.com|clicknupload|desiupload\.co|uploadhub\.|indishare\.|gdflix\.|filescloud\.|mega\.nz|drive\.google|dropbox\.com|mediafire\.com|zippyshare|filecrypt\.|uploadrar\.|rapidgator\.|nitroflare\.|turbobit\.|1fichier\.|alfafile\.|katfile\.|ddownload\.|rockfile\.|hitfile\.|worldbytez\./i;
 
 const CDN_ALLOWLIST =
   /workers\.dev|r2\.dev|glasscdn\.buzz|fukggl\.buzz|neetflixcdn|faceboook\.workers|aiplex-server|microsoft-cdn\.workers|hubcloud.*workers|telegramcdn\.workers|jiocloud.*workers|filescloud.*workers|drive\.jodise|bsnl-route|gdrivebot|pub-[a-f0-9]+\./i;

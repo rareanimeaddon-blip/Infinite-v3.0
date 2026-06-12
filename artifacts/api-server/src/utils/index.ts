@@ -1,12 +1,3 @@
-export function encodeId(url: string): string {
-  return "hd4u:" + Buffer.from(url).toString("base64url");
-}
-
-export function decodeId(id: string): string {
-  const raw = id.startsWith("hd4u:") ? id.slice(5) : id;
-  return Buffer.from(raw, "base64url").toString("utf8");
-}
-
 export function b64Decode(str: string): string {
   return Buffer.from(str, "base64").toString("utf8");
 }

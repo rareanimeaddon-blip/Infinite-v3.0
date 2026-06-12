@@ -144,24 +144,6 @@ function serveLandingPage(req: express.Request, res: express.Response) {
       tags: ["Bollywood", "Hindi Dub", "480p–4K", "Series"],
       desc: "Bollywood, Hollywood & Hindi-dubbed movies and series in 480p, 720p, 1080p & 4K.",
     },
-    {
-      key: "fourkdhub",
-      name: "4KHDHub",
-      emoji: "🔷",
-      color: "#0ea5e9",
-      glow: "rgba(14,165,233,0.3)",
-      tags: ["4K", "1080p", "HubCloud", "Direct Links"],
-      desc: "4K and 1080p direct file streams via HubCloud FSL and PixelServer links.",
-    },
-    {
-      key: "hdhub4u",
-      name: "HDHub4U",
-      emoji: "📡",
-      color: "#3b82f6",
-      glow: "rgba(59,130,246,0.3)",
-      tags: ["Bollywood", "IMAX", "Blu-Ray", "Own Catalog"],
-      desc: "Extensive Bollywood and Hollywood archive with Blu-Ray, IMAX and WebDL sources.",
-    },
   ];
 
   const providerCards = providers
@@ -205,7 +187,7 @@ function serveLandingPage(req: express.Request, res: express.Response) {
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<meta name="description" content="INFINITE STREAMS — 12 providers, one addon. AnimeSalt, RareAnime, AnimeDekho, NetMirror, MovieBox, HindMoviez, HDHub4U, Castle TV, DahmerMovies, StreamFlix, 4KHDHub, DooFlix. Install in one click."/>
+<meta name="description" content="INFINITE STREAMS — 10 providers, one addon. AnimeSalt, RareAnime, AnimeDekho, NetMirror, MovieBox, HindMoviez, Castle TV, DahmerMovies, StreamFlix, DooFlix. Install in one click."/>
 <title>INFINITE STREAMS — Stremio Addon</title>
 <link rel="preconnect" href="https://fonts.googleapis.com"/>
 <link href="https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,300..900;1,14..32,300..900&display=swap" rel="stylesheet"/>
@@ -360,7 +342,7 @@ footer{border-top:1px solid var(--border);padding:48px 0;text-align:center}
       <span class="h1-line1">INFINITE</span>
       <span class="h1-line2">STREAMS</span>
     </h1>
-    <p class="hero-sub">12 providers. One addon. Zero compromise.<br/>Movies, series &amp; anime from every corner of the web.</p>
+    <p class="hero-sub">10 providers. One addon. Zero compromise.<br/>Movies, series &amp; anime from every corner of the web.</p>
     <div class="credit-tag">By <a href="https://t.me/Master_si" target="_blank">@Master_si</a></div>
 
     <div class="install-box">
@@ -382,7 +364,7 @@ footer{border-top:1px solid var(--border);padding:48px 0;text-align:center}
     </div>
 
     <div class="stats-row">
-      <div class="stat"><div class="stat-num">12</div><div class="stat-lbl">Providers</div></div>
+      <div class="stat"><div class="stat-num">10</div><div class="stat-lbl">Providers</div></div>
       <div class="stat"><div class="stat-num">${manifest.catalogs.length}</div><div class="stat-lbl">Catalogs</div></div>
       <div class="stat"><div class="stat-num">4K</div><div class="stat-lbl">Max Quality</div></div>
       <div class="stat"><div class="stat-num">∞</div><div class="stat-lbl">Content</div></div>
@@ -393,7 +375,7 @@ footer{border-top:1px solid var(--border);padding:48px 0;text-align:center}
 <section class="section">
   <div class="container">
     <div class="section-label">Providers</div>
-    <h2 class="section-title">12 sources, one install</h2>
+    <h2 class="section-title">10 sources, one install</h2>
     <p class="section-sub">Every provider is queried in parallel and deduplicated — you always get the best available stream.</p>
     <div class="providers-grid">${providerCards}</div>
   </div>
@@ -407,7 +389,7 @@ footer{border-top:1px solid var(--border);padding:48px 0;text-align:center}
     <div class="configure-box">
       <div class="configure-header">
         <span class="configure-title">Provider Selection</span>
-        <span class="sel-count" id="sel-count">12 / 12 selected</span>
+        <span class="sel-count" id="sel-count">10 / 10 selected</span>
       </div>
       <div class="cb-list">${providerCheckboxes}</div>
       <div class="custom-install-box">

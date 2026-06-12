@@ -156,8 +156,7 @@ export async function extractHubCloud(
         });
       } else if (link.includes("r2.dev")) {
         // Include ALL R2 URLs — presigned or plain private bucket.
-        // hd4uStreamToStremio / fourkdStreamToStremio will route these through
-        // the proxy, which first tries re-extraction for a better CDN URL
+        // The proxy will attempt re-extraction for a better CDN URL
         // (BuzzServer / 10Gbps), then falls back to a 302 redirect so the
         // player's own IP can reach the R2 bucket directly.
         streams.push({

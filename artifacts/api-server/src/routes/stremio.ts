@@ -1,5 +1,5 @@
 import { Router, type Request, type Response, type NextFunction } from "express";
-import { manifest, CATALOG_MAP } from "../manifest.js";
+import { manifest } from "../manifest.js";
 import { PROVIDER_LIST, maskToConfig, type ProviderKey } from "../lib/provider-config.js";
 import {
   getAllCatalogItems as raGetAllCatalogItems,
@@ -25,15 +25,6 @@ import {
 import { extractStreamFromArgon } from "../providers/rareanime/argon-extractor.js";
 import { fetchNetmirrorStreams } from "../providers/netmirror.js";
 import { getStreams as hindmoviezGetStreams, getCatalog as hindmoviezGetCatalog } from "../providers/hindmovies.js";
-import {
-  getHomepage,
-  searchContent,
-  getMeta,
-  getStreams,
-  findByMeta,
-  findCandidatePageUrls,
-} from "../providers/hdhub4u.js";
-import { getFourkdHubStreams } from "../providers/fourkdhub.js";
 import { getCastleTvImdbStreams } from "../castle-tv/handlers.js";
 import { fetchDahmerStreams } from "../castle-tv/dahmermovies.js";
 import { fetchStreamflixStreams } from "../castle-tv/streamflix.js";
@@ -54,7 +45,6 @@ import {
 } from "../providers/animedekho.js";
 import { resolveExtractor, type Stream as ADStream } from "../extractors/animedekho/index.js";
 import { titleSimilarityScore } from "../utils/title-score.js";
-import { decodeId } from "../utils/index.js";
 import {
   resolveMeta,
   resolveMetaFromTmdbId,
@@ -334,24 +324,7 @@ router.get(
         return;
       }
 
-      const items = search
-        ? await searchContent(search, page)
-        : await getHomepage(CATALOG_MAP[id as keyof typeof CATALOG_MAP] ?? "", page);
-
-      // hdhub4u-webseries declares type:"series" in manifest — enforce it on every item
-      const forceType: "movie" | "series" | undefined =
-        id === "hdhub4u-webseries" ? "series" : undefined;
-
-      res.json({
-        metas: items.map((item) => ({
-          id: item.id,
-          type: forceType ?? item.type,
-          name: item.name,
-          poster: item.poster,
-          description: item.description,
-          releaseInfo: item.releaseInfo,
-        })),
-      });
+      res.json({ metas: [] });
     } catch (e) {
       logger.error({ err: e }, "Stremio: catalog error");
       res.json({ metas: [] });
@@ -496,43 +469,7 @@ router.get("/meta/:type/:id.json", async (req, res) => {
       return;
     }
 
-    // HDHub4U native IDs
-    let metaItem;
-    if (id.startsWith("hd4u:")) {
-      metaItem = await getMeta(decodeId(id));
-    } else if (id.startsWith("tt")) {
-      const meta = await resolveMeta(id, type as "movie" | "series");
-      if (meta) metaItem = await findByMeta(meta, 1);
-    }
-
-    if (!metaItem) { res.json({ meta: null }); return; }
-
-    const stremioMeta: Record<string, unknown> = {
-      id,
-      type: metaItem.type,
-      name: metaItem.name,
-      poster: metaItem.poster,
-      background: metaItem.background,
-      description: metaItem.description,
-      year: metaItem.year,
-      genres: metaItem.genres,
-    };
-
-    if (metaItem.cast?.length) stremioMeta["cast"] = metaItem.cast;
-
-    if (metaItem.videos?.length) {
-      stremioMeta["videos"] = metaItem.videos.map((ep) => ({
-        id: `${id}:${ep.season}:${ep.episode}`,
-        title: ep.title,
-        season: ep.season,
-        episode: ep.episode,
-        overview: ep.overview,
-        thumbnail: ep.thumbnail,
-        released: ep.released ? new Date(ep.released).toISOString() : undefined,
-      }));
-    }
-
-    res.json({ meta: stremioMeta });
+    res.json({ meta: null });
   } catch (e) {
     logger.error({ err: e, id }, "Stremio: meta error");
     res.json({ meta: null });
@@ -554,230 +491,6 @@ function publicOrigin(req: Request): string {
 function apiBase(req: Request): string {
   return `${publicOrigin(req)}${BASE_PATH}`;
 }
-
-// ─── HDHub4U helpers ──────────────────────────────────────────────────────────
-
-/** True for plain pub-*.r2.dev URLs that have no presigning params. */
-function isPlainR2(url: string): boolean {
-  return /pub-[0-9a-f]{10,}\.r2\.dev\//i.test(url) &&
-         !/[?&](X-Amz-Signature|token|Expires)=/i.test(url);
-}
-
-function hd4uStreamToStremio(s: Stream, req?: Request): Record<string, unknown> {
-  const isHls = s.type === "hls" || (s.url.includes(".m3u8") && s.type !== "mp4");
-  if (isHls && req) {
-    const base = apiBase(req);
-    const referer = s.headers?.["Referer"] || s.headers?.["referer"] || "";
-    let origin = referer;
-    try { if (referer) origin = new URL(referer).origin; } catch {}
-    const proxiedUrl = `${base}/m3u8?url=${encodeURIComponent(s.url)}&referer=${encodeURIComponent(referer)}&origin=${encodeURIComponent(origin)}`;
-    return {
-      name: s.name,
-      title: s.title,
-      url: proxiedUrl,
-      behaviorHints: { notWebReady: true },
-    };
-  }
-
-  // Plain pub-*.r2.dev private bucket URLs must NOT go through our proxy.
-  // Our server (Cloudflare data-centre IP) is blocked by R2; the player's
-  // mobile/residential IP can access public R2 buckets directly.
-  // We still wrap in the proxy so the proxy can attempt re-extraction for a
-  // better CDN URL (BuzzServer / 10Gbps), and only fall back to a 302 redirect
-  // to R2 if no better option is found — the player follows the redirect from
-  // its own IP.
-  if (req && isPlainR2(s.url)) {
-    const base = apiBase(req);
-    const lpParam = s.reExtractUrl ? `&lp=${encodeParam(s.reExtractUrl)}` : "";
-    const referer = s.headers?.["Referer"] || s.headers?.["referer"] || "";
-    const refParam = referer ? `&ref=${encodeParam(referer)}` : "";
-    const proxiedUrl = `${base}/proxy?u=${encodeParam(s.url)}${refParam}${lpParam}`;
-    return {
-      name: s.name,
-      title: s.title,
-      url: proxiedUrl,
-      behaviorHints: { notWebReady: false },
-    };
-  }
-
-  // For MP4 streams that carry a Referer header (e.g. Backblaze B2 / FSL /
-  // S3 buckets from HubCloud), route through the addon proxy so the correct
-  // Referer is sent server-side — players/Stremio do not forward proxyHeaders
-  // reliably, so direct URLs with bucket hotlink-protection return 403.
-  const referer = s.headers?.["Referer"] || s.headers?.["referer"] || "";
-  if (referer && req) {
-    const base = apiBase(req);
-    let origin = referer;
-    try { origin = new URL(referer).origin; } catch {}
-    // Include the stable HubCloud landing page URL (lp) when available so the
-    // proxy can re-run full 2-step extraction on token expiry instead of just
-    // re-fetching the short-lived download-page URL stored in ref.
-    const lpParam = s.reExtractUrl ? `&lp=${encodeParam(s.reExtractUrl)}` : "";
-    const proxiedUrl = `${base}/proxy?u=${encodeParam(s.url)}&ref=${encodeParam(referer)}&ori=${encodeParam(origin)}${lpParam}`;
-    return {
-      name: s.name,
-      title: s.title,
-      url: proxiedUrl,
-      behaviorHints: { notWebReady: false },
-    };
-  }
-  // No Referer and not R2 — still route through proxy so ExoPlayer gets correct
-  // Content-Type, HEAD support, and re-extraction on token expiry.
-  // BuzzServer / ZipDisk / 10Gbps CDN URLs are token-based and work without
-  // Referer, so the proxy can fetch them with its default neutral headers.
-  if (req) {
-    const base = apiBase(req);
-    const lpParam = s.reExtractUrl ? `&lp=${encodeParam(s.reExtractUrl)}` : "";
-    const proxiedUrl = `${base}/proxy?u=${encodeParam(s.url)}${lpParam}`;
-    return {
-      name: s.name,
-      title: s.title,
-      url: proxiedUrl,
-      behaviorHints: { notWebReady: false },
-    };
-  }
-  return {
-    name: s.name,
-    title: s.title,
-    url: s.url,
-    behaviorHints: {
-      notWebReady: s.type === "mp4" ? false : true,
-      ...(s.headers ? { proxyHeaders: { request: s.headers } } : {}),
-      ...s.behaviorHints,
-    },
-  };
-}
-
-function fourkdStreamToStremio(s: import("../providers/fourkdhub.js").FourkdStream, req?: Request): Record<string, unknown> {
-  // Plain R2 private bucket URLs — proxy attempts re-extraction for a better
-  // CDN URL; falls back to 302 redirect so the player's own IP reaches R2.
-  if (req && isPlainR2(s.url)) {
-    const base = apiBase(req);
-    const lpParam = s.reExtractUrl ? `&lp=${encodeParam(s.reExtractUrl)}` : "";
-    const referer = s.headers?.["Referer"] || s.headers?.["referer"] || "";
-    const refParam = referer ? `&ref=${encodeParam(referer)}` : "";
-    const proxiedUrl = `${base}/proxy?u=${encodeParam(s.url)}${refParam}${lpParam}`;
-    return {
-      name: s.name,
-      title: s.title,
-      url: proxiedUrl,
-      behaviorHints: { notWebReady: false },
-    };
-  }
-  const referer = s.headers?.["Referer"] || s.headers?.["referer"] || "";
-  if (referer && req) {
-    const base = apiBase(req);
-    let origin = referer;
-    try { origin = new URL(referer).origin; } catch {}
-    const lpParam = s.reExtractUrl ? `&lp=${encodeParam(s.reExtractUrl)}` : "";
-    const proxiedUrl = `${base}/proxy?u=${encodeParam(s.url)}&ref=${encodeParam(referer)}&ori=${encodeParam(origin)}${lpParam}`;
-    return {
-      name: s.name,
-      title: s.title,
-      url: proxiedUrl,
-      behaviorHints: { ...s.behaviorHints, notWebReady: false },
-    };
-  }
-  // No Referer and not R2 — still route through proxy for ExoPlayer compatibility.
-  if (req) {
-    const base = apiBase(req);
-    const lpParam = s.reExtractUrl ? `&lp=${encodeParam(s.reExtractUrl)}` : "";
-    const proxiedUrl = `${base}/proxy?u=${encodeParam(s.url)}${lpParam}`;
-    return {
-      name: s.name,
-      title: s.title,
-      url: proxiedUrl,
-      behaviorHints: { notWebReady: false },
-    };
-  }
-  return {
-    name: s.name,
-    title: s.title,
-    url: s.url,
-    behaviorHints: s.behaviorHints,
-  };
-}
-
-async function getHDHub4UStreams(
-  id: string,
-  type: string,
-  resolvedMeta?: ResolvedMeta | null,
-  season?: number,
-  episode?: number,
-  req?: Request,
-): Promise<Record<string, unknown>[]> {
-  try {
-    let streams: Stream[] = [];
-
-    if (id.startsWith("hd4u:")) {
-      const parts = id.split(":");
-      if (parts.length >= 3) {
-        const baseId = parts.slice(0, 2).join(":");
-        const s = parseInt(parts[2] ?? "1");
-        const e = parseInt(parts[3] ?? "1");
-        const pageUrl = decodeId(baseId);
-        const meta = await getMeta(pageUrl);
-        if (meta?.videos) {
-          const ep = meta.videos.find((v) => v.season === s && v.episode === e);
-          if (ep?.links) streams = await getStreams(pageUrl, ep.links);
-        }
-        if (!streams.length && meta?.links)
-          streams = await getStreams(pageUrl, meta.links);
-      } else {
-        const pageUrl = decodeId(id);
-        const meta = await getMeta(pageUrl);
-        if (meta?.links) streams = await getStreams(pageUrl, meta.links);
-      }
-      return streams.map((s) => hd4uStreamToStremio(s, req));
-    }
-
-    const meta = resolvedMeta ?? (await resolveMeta(id, type as "movie" | "series"));
-    if (!meta) { logger.warn({ id }, "HDHub4U: meta resolution failed"); return []; }
-
-    const targetSeason = season ?? 1;
-    const targetEpisode = episode ?? 1;
-
-    logger.info({ imdbId: meta.imdbId, title: meta.title, season: targetSeason, episode: targetEpisode }, "HDHub4U: resolving");
-
-    // Get all candidate page URLs sorted by score. Try each in order until one
-    // yields actual streams — the best-scored candidate may have dead/missing links
-    // (e.g. an older re-post with expired hosting) while a newer re-upload works.
-    const candidateUrls = await findCandidatePageUrls(meta, targetSeason);
-    if (!candidateUrls.length) {
-      logger.warn({ imdbId: meta.imdbId }, "HDHub4U: no matching page");
-      return [];
-    }
-
-    let matchedTitle = "";
-    for (const pageUrl of candidateUrls.slice(0, 4)) {
-      const metaItem = await getMeta(pageUrl);
-      if (!metaItem) continue;
-      matchedTitle = metaItem.name;
-
-      if (metaItem.type === "series" && metaItem.videos?.length) {
-        let ep = metaItem.videos.find((v) => v.season === targetSeason && v.episode === targetEpisode);
-        if (!ep) ep = metaItem.videos.find((v) => v.episode === targetEpisode);
-        if (ep?.links?.length) {
-          streams = await getStreams(metaItem.id, ep.links);
-        } else if (metaItem.links?.length) {
-          streams = await getStreams(metaItem.id, metaItem.links);
-        }
-      } else if (metaItem.links?.length) {
-        streams = await getStreams(metaItem.id, metaItem.links);
-      }
-
-      if (streams.length > 0) break;
-      logger.info({ imdbId: meta.imdbId, pageUrl, matchedTitle }, "HDHub4U: candidate had no streams, trying next");
-    }
-
-    logger.info({ imdbId: meta.imdbId, matchedTitle, count: streams.length }, "HDHub4U: done");
-    return streams.map((s) => hd4uStreamToStremio(s, req));
-  } catch (err) {
-    logger.error({ err, id }, "HDHub4U: provider error");
-    return [];
-  }
-}
-
 
 async function getAnimeSaltStreams(
   imdbId: string,
@@ -1880,46 +1593,6 @@ router.get("/stream/:type/:id.json", async (req, res) => {
       return;
     }
 
-    // ── Native hd4u: IDs — HDHub4U + MovieBox ────────────────────────────────
-    if (id.startsWith("hd4u:")) {
-      const parts = id.split(":");
-      const hd4uSeason  = parts[2] !== undefined ? parseInt(parts[2], 10) : 0;
-      const hd4uEpisode = parts[3] !== undefined ? parseInt(parts[3], 10) : 0;
-      const hd4uBaseId  = parts.length >= 3 ? parts.slice(0, 2).join(":") : id;
-      const hd4uPageUrl = decodeId(hd4uBaseId);
-
-      const hd4uPageMeta = await getMeta(hd4uPageUrl).catch(() => null);
-
-      let mbStreamsPromise: Promise<Record<string, unknown>[]> = Promise.resolve([]);
-      if (hd4uPageMeta?.name) {
-        const synthMeta: ResolvedMeta = {
-          imdbId: "",
-          title: hd4uPageMeta.name,
-          year: hd4uPageMeta.year,
-          type: type as "movie" | "series",
-          aliases: [],
-        };
-        const mbS = hd4uSeason  || (type === "series" ? 1 : 0);
-        const mbE = hd4uEpisode || (type === "series" ? 1 : 0);
-        mbStreamsPromise = getMovieBoxStreams(synthMeta, mbS, mbE, req, id);
-      }
-
-      const [hdResult, mbResult] = await Promise.allSettled([
-        getHDHub4UStreams(id, type, undefined, undefined, undefined, req),
-        mbStreamsPromise,
-      ]);
-
-      const hdStreams = hdResult.status === "fulfilled" ? hdResult.value : [];
-      const mbStreams = mbResult.status === "fulfilled" ? mbResult.value : [];
-      if (hdResult.status === "rejected") logger.error({ err: hdResult.reason, id }, "HDHub4U: crashed on hd4u:");
-      if (mbResult.status === "rejected") logger.error({ err: mbResult.reason, id }, "MovieBox: crashed on hd4u:");
-
-      const combined = mergeSubtitles(dedup([...hdStreams, ...mbStreams]));
-      logger.info({ id, hd: hdStreams.length, mb: mbStreams.length, combined: combined.length }, "Stremio: hd4u combined");
-      res.json({ streams: combined });
-      return;
-    }
-
     // ── Native animedekho: IDs — AnimeDekho native + AnimeSalt by title ──────
     if (id.startsWith("animedekho:")) {
       const seMatch = id.match(/:(\d+):(\d+)$/);
@@ -1979,24 +1652,22 @@ router.get("/stream/:type/:id.json", async (req, res) => {
         return;
       }
 
-      logger.info({ imdbId, title: meta.title, year: meta.year }, "Stremio: IMDB — querying 12 providers");
+      logger.info({ imdbId, title: meta.title, year: meta.year }, "Stremio: IMDB — querying 10 providers");
       logResolve({ imdbId, step: "resolve", status: "ok", detail: `${meta.title} (${meta.year})` });
 
       const sfTmdbId = await imdbToTmdbId(imdbId, type).catch(() => null);
 
       const ep = getEnabledProviders(req as RequestWithConfig);
-      const [asResult, raResult, adResult, nmResult, mbResult, hmResult, hdResult, ctResult, dmResult, sfResult, fkResult, dfResult] = await Promise.allSettled([
+      const [asResult, raResult, adResult, nmResult, mbResult, hmResult, ctResult, dmResult, sfResult, dfResult] = await Promise.allSettled([
         ep.has("animesalt") ? getAnimeSaltStreams(imdbId, type, season, episode, req) : Promise.resolve([]),
         ep.has("rareanime") ? getRareAnimeStreamsByTitle(meta.title, type, season, episode, req, meta.aliases) : Promise.resolve([]),
         ep.has("animedekho") ? getAnimeDekhoStreams(meta.title, type, season, episode) : Promise.resolve([]),
         ep.has("netmirror") ? fetchNetmirrorStreams(type as "movie" | "series", imdbId, season, episode, req) : Promise.resolve([]),
         ep.has("moviebox") ? getMovieBoxStreams(meta, season, episode, req, imdbId) : Promise.resolve([]),
         ep.has("hindmovies") ? hindmoviezGetStreams(type as "movie" | "series", imdbId, season, episode) : Promise.resolve([]),
-        ep.has("hdhub4u") ? getHDHub4UStreams(imdbId, type, meta, season, episode, req) : Promise.resolve([]),
         ep.has("castletv") ? getCastleTvStreams(imdbId, type, meta.title, meta.year, season, episode) : Promise.resolve([]),
         ep.has("dahmermovies") ? getDahmerMoviesStreams(meta.title, meta.year, type, season, episode, req) : Promise.resolve([]),
         ep.has("streamflix") ? getStreamflixStreams(sfTmdbId, type, season, episode) : Promise.resolve([]),
-        ep.has("fourkdhub") ? getFourkdHubStreams(meta.title, meta.year, type, season, episode) : Promise.resolve([]),
         ep.has("dooflix") ? getDooflixStreams(apiBase(req), imdbId, type, season, episode) : Promise.resolve([]),
       ]);
 
@@ -2006,11 +1677,9 @@ router.get("/stream/:type/:id.json", async (req, res) => {
       const nmStreams = nmResult.status === "fulfilled" ? nmResult.value : [];
       const mbStreams = mbResult.status === "fulfilled" ? mbResult.value : [];
       const hmStreams = hmResult.status === "fulfilled" ? proxyHindMoviezStreams(hmResult.value, req) : [];
-      const hdStreams = hdResult.status === "fulfilled" ? hdResult.value : [];
       const ctStreams = ctResult.status === "fulfilled" ? ctResult.value : [];
       const dmStreams = dmResult.status === "fulfilled" ? dmResult.value : [];
       const sfStreams = sfResult.status === "fulfilled" ? sfResult.value : [];
-      const fkStreams = (fkResult.status === "fulfilled" ? fkResult.value : []).map((s) => fourkdStreamToStremio(s, req));
       const dfStreams = (dfResult.status === "fulfilled" ? dfResult.value : []) as DooflixStream[];
 
       if (asResult.status === "rejected") logger.error({ err: asResult.reason, imdbId }, "AnimeSalt: crashed");
@@ -2019,20 +1688,18 @@ router.get("/stream/:type/:id.json", async (req, res) => {
       if (nmResult.status === "rejected") logger.error({ err: nmResult.reason, imdbId }, "NetMirror: crashed");
       if (mbResult.status === "rejected") logger.error({ err: mbResult.reason, imdbId }, "MovieBox: crashed");
       if (hmResult.status === "rejected") logger.error({ err: hmResult.reason, imdbId }, "HindMoviez: crashed");
-      if (hdResult.status === "rejected") logger.error({ err: hdResult.reason, imdbId }, "HDHub4U: crashed");
       if (ctResult.status === "rejected") logger.error({ err: ctResult.reason, imdbId }, "CastleTV: crashed");
       if (dmResult.status === "rejected") logger.error({ err: dmResult.reason, imdbId }, "DahmerMovies: crashed");
       if (sfResult.status === "rejected") logger.error({ err: sfResult.reason, imdbId }, "StreamFlix: crashed");
-      if (fkResult.status === "rejected") logger.error({ err: fkResult.reason, imdbId }, "4KHDHub: crashed");
       if (dfResult.status === "rejected") logger.error({ err: dfResult.reason, imdbId }, "DooFlix: crashed");
 
-      const raw = mergeSubtitles(dedup(([...asStreams, ...raStreams, ...adStreams, ...nmStreams, ...sfStreams, ...dfStreams, ...ctStreams, ...mbStreams, ...dmStreams, ...hmStreams, ...fkStreams, ...hdStreams]) as Record<string, unknown>[]));
+      const raw = mergeSubtitles(dedup(([...asStreams, ...raStreams, ...adStreams, ...nmStreams, ...sfStreams, ...dfStreams, ...ctStreams, ...mbStreams, ...dmStreams, ...hmStreams]) as Record<string, unknown>[]));
       const combined = premiumFormat(raw, meta.title, contentType, season, episode);
       logger.info(
-        { imdbId, title: meta.title, as: asStreams.length, ra: raStreams.length, ad: adStreams.length, nm: nmStreams.length, mb: mbStreams.length, hm: hmStreams.length, hd: hdStreams.length, ct: ctStreams.length, dm: dmStreams.length, sf: sfStreams.length, fk: fkStreams.length, df: dfStreams.length, combined: combined.length },
-        "Stremio: 12 providers aggregated",
+        { imdbId, title: meta.title, as: asStreams.length, ra: raStreams.length, ad: adStreams.length, nm: nmStreams.length, mb: mbStreams.length, hm: hmStreams.length, ct: ctStreams.length, dm: dmStreams.length, sf: sfStreams.length, df: dfStreams.length, combined: combined.length },
+        "Stremio: 10 providers aggregated",
       );
-      logResolve({ imdbId, step: "done", status: combined.length ? "ok" : "fail", detail: `as=${asStreams.length} ra=${raStreams.length} ad=${adStreams.length} nm=${nmStreams.length} mb=${mbStreams.length} hm=${hmStreams.length} hd=${hdStreams.length} ct=${ctStreams.length} dm=${dmStreams.length} sf=${sfStreams.length} fk=${fkStreams.length} df=${dfStreams.length} total=${combined.length}` });
+      logResolve({ imdbId, step: "done", status: combined.length ? "ok" : "fail", detail: `as=${asStreams.length} ra=${raStreams.length} ad=${adStreams.length} nm=${nmStreams.length} mb=${mbStreams.length} hm=${hmStreams.length} ct=${ctStreams.length} dm=${dmStreams.length} sf=${sfStreams.length} df=${dfStreams.length} total=${combined.length}` });
 
       setStreamCache(ckey, combined, TTL_MS_DEFAULT);
       res.json({ streams: combined });
@@ -2058,25 +1725,23 @@ router.get("/stream/:type/:id.json", async (req, res) => {
         return;
       }
 
-      logger.info({ tmdbId: numericTmdbId, imdbId: meta.imdbId, title: meta.title }, "Stremio: TMDB — querying 12 providers");
+      logger.info({ tmdbId: numericTmdbId, imdbId: meta.imdbId, title: meta.title }, "Stremio: TMDB — querying 10 providers");
       logResolve({ imdbId: id, step: "resolve", status: "ok", detail: `${meta.title} (${meta.year}) imdb=${meta.imdbId}` });
 
       const hasImdb = meta.imdbId.startsWith("tt");
       const nmId = hasImdb ? meta.imdbId : id;
 
       const ep2 = getEnabledProviders(req as RequestWithConfig);
-      const [asResult, raResult, adResult, nmResult, mbResult, hmResult, hdResult, ctResult, dmResult, sfResult, fkResult, dfResult] = await Promise.allSettled([
+      const [asResult, raResult, adResult, nmResult, mbResult, hmResult, ctResult, dmResult, sfResult, dfResult] = await Promise.allSettled([
         (ep2.has("animesalt") && hasImdb) ? getAnimeSaltStreams(meta.imdbId, type, season, episode, req) : Promise.resolve([]),
         ep2.has("rareanime") ? getRareAnimeStreamsByTitle(meta.title, type, season, episode, req, meta.aliases) : Promise.resolve([]),
         ep2.has("animedekho") ? getAnimeDekhoStreams(meta.title, type, season, episode) : Promise.resolve([]),
         ep2.has("netmirror") ? fetchNetmirrorStreams(type as "movie" | "series", nmId, season, episode, req) : Promise.resolve([]),
         ep2.has("moviebox") ? getMovieBoxStreams(meta, season, episode, req, id) : Promise.resolve([]),
         (ep2.has("hindmovies") && hasImdb) ? hindmoviezGetStreams(type as "movie" | "series", meta.imdbId, season, episode) : Promise.resolve([]),
-        ep2.has("hdhub4u") ? getHDHub4UStreams(meta.imdbId, type, meta, season, episode) : Promise.resolve([]),
         (ep2.has("castletv") && hasImdb) ? getCastleTvStreams(meta.imdbId, type, meta.title, meta.year, season, episode) : Promise.resolve([]),
         ep2.has("dahmermovies") ? getDahmerMoviesStreams(meta.title, meta.year, type, season, episode, req) : Promise.resolve([]),
         ep2.has("streamflix") ? getStreamflixStreams(numericTmdbId, type, season, episode) : Promise.resolve([]),
-        ep2.has("fourkdhub") ? getFourkdHubStreams(meta.title, meta.year, type, season, episode) : Promise.resolve([]),
         (ep2.has("dooflix") && hasImdb) ? getDooflixStreams(apiBase(req), meta.imdbId, type, season, episode) : Promise.resolve([]),
       ]);
 
@@ -2086,11 +1751,9 @@ router.get("/stream/:type/:id.json", async (req, res) => {
       const nmStreams = nmResult.status === "fulfilled" ? nmResult.value : [];
       const mbStreams = mbResult.status === "fulfilled" ? mbResult.value : [];
       const hmStreams = hmResult.status === "fulfilled" ? proxyHindMoviezStreams(hmResult.value, req) : [];
-      const hdStreams = hdResult.status === "fulfilled" ? hdResult.value : [];
       const ctStreams = ctResult.status === "fulfilled" ? ctResult.value : [];
       const dmStreams = dmResult.status === "fulfilled" ? dmResult.value : [];
       const sfStreams = sfResult.status === "fulfilled" ? sfResult.value : [];
-      const fkStreams = (fkResult.status === "fulfilled" ? fkResult.value : []).map((s) => fourkdStreamToStremio(s, req));
       const dfStreams = (dfResult.status === "fulfilled" ? dfResult.value : []) as DooflixStream[];
 
       if (asResult.status === "rejected") logger.error({ err: asResult.reason, tmdbId: numericTmdbId }, "AnimeSalt: crashed");
@@ -2099,20 +1762,18 @@ router.get("/stream/:type/:id.json", async (req, res) => {
       if (nmResult.status === "rejected") logger.error({ err: nmResult.reason, tmdbId: numericTmdbId }, "NetMirror: crashed");
       if (mbResult.status === "rejected") logger.error({ err: mbResult.reason, tmdbId: numericTmdbId }, "MovieBox: crashed");
       if (hmResult.status === "rejected") logger.error({ err: hmResult.reason, tmdbId: numericTmdbId }, "HindMoviez: crashed");
-      if (hdResult.status === "rejected") logger.error({ err: hdResult.reason, tmdbId: numericTmdbId }, "HDHub4U: crashed");
       if (ctResult.status === "rejected") logger.error({ err: ctResult.reason, tmdbId: numericTmdbId }, "CastleTV: crashed");
       if (dmResult.status === "rejected") logger.error({ err: dmResult.reason, tmdbId: numericTmdbId }, "DahmerMovies: crashed");
       if (sfResult.status === "rejected") logger.error({ err: sfResult.reason, tmdbId: numericTmdbId }, "StreamFlix: crashed");
-      if (fkResult.status === "rejected") logger.error({ err: fkResult.reason, tmdbId: numericTmdbId }, "4KHDHub: crashed");
       if (dfResult.status === "rejected") logger.error({ err: dfResult.reason, tmdbId: numericTmdbId }, "DooFlix: crashed");
 
-      const raw2 = mergeSubtitles(dedup(([...asStreams, ...raStreams, ...adStreams, ...nmStreams, ...sfStreams, ...dfStreams, ...ctStreams, ...mbStreams, ...dmStreams, ...hmStreams, ...fkStreams, ...hdStreams]) as Record<string, unknown>[]));
+      const raw2 = mergeSubtitles(dedup(([...asStreams, ...raStreams, ...adStreams, ...nmStreams, ...sfStreams, ...dfStreams, ...ctStreams, ...mbStreams, ...dmStreams, ...hmStreams]) as Record<string, unknown>[]));
       const combined = premiumFormat(raw2, meta.title, contentType, season, episode);
       logger.info(
-        { tmdbId: numericTmdbId, title: meta.title, as: asStreams.length, ra: raStreams.length, ad: adStreams.length, nm: nmStreams.length, mb: mbStreams.length, hm: hmStreams.length, hd: hdStreams.length, ct: ctStreams.length, dm: dmStreams.length, sf: sfStreams.length, fk: fkStreams.length, df: dfStreams.length, combined: combined.length },
-        "Stremio: TMDB 12 providers aggregated",
+        { tmdbId: numericTmdbId, title: meta.title, as: asStreams.length, ra: raStreams.length, ad: adStreams.length, nm: nmStreams.length, mb: mbStreams.length, hm: hmStreams.length, ct: ctStreams.length, dm: dmStreams.length, sf: sfStreams.length, df: dfStreams.length, combined: combined.length },
+        "Stremio: TMDB 10 providers aggregated",
       );
-      logResolve({ imdbId: id, step: "done", status: combined.length ? "ok" : "fail", detail: `as=${asStreams.length} ra=${raStreams.length} ad=${adStreams.length} nm=${nmStreams.length} mb=${mbStreams.length} hm=${hmStreams.length} hd=${hdStreams.length} ct=${ctStreams.length} dm=${dmStreams.length} sf=${sfStreams.length} fk=${fkStreams.length} df=${dfStreams.length} total=${combined.length}` });
+      logResolve({ imdbId: id, step: "done", status: combined.length ? "ok" : "fail", detail: `as=${asStreams.length} ra=${raStreams.length} ad=${adStreams.length} nm=${nmStreams.length} mb=${mbStreams.length} hm=${hmStreams.length} ct=${ctStreams.length} dm=${dmStreams.length} sf=${sfStreams.length} df=${dfStreams.length} total=${combined.length}` });
 
       setStreamCache(ckey, combined, TTL_MS_DEFAULT);
       res.json({ streams: combined });

@@ -3,7 +3,6 @@ import { extractHubDrive } from "./hubdrive.js";
 import { extractHubCDN, extractHubcdnn } from "./hubcdn.js";
 import { extractHblinks } from "./hblinks.js";
 
-import { extractHdStream4u } from "./hdstream4u.js";
 import { extractPixelDrain } from "./pixeldrain.js";
 import { extractStreamTape } from "./streamtape.js";
 import { logger } from "../lib/logger.js";
@@ -12,13 +11,6 @@ import type { Stream } from "./types.js";
 
 export type { Stream };
 export { isDirectStreamUrl };
-
-function prefixHdHub4u(streams: Stream[]): Stream[] {
-  return streams.map((s) => ({
-    ...s,
-    name: s.name.startsWith("HDHub4U") ? s.name : `HDHub4U ${s.name}`,
-  }));
-}
 
 export async function extractStreams(url: string): Promise<Stream[]> {
   const lower = url.toLowerCase();
@@ -31,48 +23,45 @@ export async function extractStreams(url: string): Promise<Stream[]> {
 
   try {
     if (/hubdrive/i.test(url)) {
-      return prefixHdHub4u(await extractHubDrive(url));
+      return await extractHubDrive(url);
     }
     if (/hubcloud/i.test(url)) {
-      return prefixHdHub4u(await extractHubCloud(url));
+      return await extractHubCloud(url);
     }
     if (/hubcdnn?/i.test(url) && /reurl/i.test(url)) {
-      return prefixHdHub4u(await extractHubcdnn(url));
+      return await extractHubcdnn(url);
     }
     if (/hubcdn/i.test(url)) {
-      return prefixHdHub4u(await extractHubCDN(url));
+      return await extractHubCDN(url);
     }
     if (/hblinks|hubstreamdad/i.test(url)) {
-      return prefixHdHub4u(await extractHblinks(url));
-    }
-    if (/hdstream4u/i.test(url)) {
-      return prefixHdHub4u(await extractHdStream4u(url));
+      return await extractHblinks(url);
     }
     if (/pixeldrain/i.test(url)) {
-      return prefixHdHub4u(await extractPixelDrain(url));
+      return await extractPixelDrain(url);
     }
     if (/streamtape/i.test(url)) {
-      return prefixHdHub4u(await extractStreamTape(url));
+      return await extractStreamTape(url);
     }
 
     if (/\.m3u8/.test(lower)) {
-      return prefixHdHub4u([{ name: "Stream", title: "HLS", url, type: "hls" }]);
+      return [{ name: "Stream", title: "HLS", url, type: "hls" }];
     }
     if (/\.mp4/.test(lower)) {
-      return prefixHdHub4u([{ name: "Stream", title: "MP4", url, type: "mp4" }]);
+      return [{ name: "Stream", title: "MP4", url, type: "mp4" }];
     }
 
     if (isDirectStreamUrl(url)) {
       logger.info({ url }, "Extractor: passing through as direct CDN stream");
-      return prefixHdHub4u([
+      return [
         {
-          name: "HDHub4U",
+          name: "Stream",
           title: "Direct Stream",
           url,
           type: "mp4",
           behaviorHints: { notWebReady: false },
         },
-      ]);
+      ];
     }
 
     logger.debug({ url }, "Extractor: skipping — not a known direct stream URL");

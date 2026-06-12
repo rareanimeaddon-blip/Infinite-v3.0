@@ -2,10 +2,10 @@ export const ADDON_ID = "community.infinitestreams.stremio";
 
 export const manifest = {
   id: ADDON_ID,
-  version: "8.1.0",
+  version: "8.2.0",
   name: "INFINITE STREAMS",
   description:
-    "♾️ 12 providers. One addon. Zero compromise.\n" +
+    "♾️ 10 providers. One addon. Zero compromise.\n" +
     "⛩️ AnimeSalt — Hindi, English & Japanese multi-audio anime HLS.\n" +
     "🌙 RareAnime India — Hindi & Tamil dubbed anime (rareanimes.buzz + animetoonhindi).\n" +
     "🇮🇳 AnimeDekho — Hindi/Tamil/Telugu dubbed anime via 15+ extractors.\n" +
@@ -15,8 +15,6 @@ export const manifest = {
     "💀 DahmerMovies — High-quality 1080p/4K direct file streams.\n" +
     "🎞️ HindMoviez — Bollywood, Hollywood & Hindi-dubbed in 480p–4K.\n" +
     "🍿 MovieBox — Multi-audio: Hindi, Bengali, English & more.\n" +
-    "📡 HDHub4U — Bollywood & Hollywood: Blu-Ray, IMAX & WebDL.\n" +
-    "🔷 4KHDHub — 4K/1080p HubCloud direct file streams.\n" +
     "🎬 DooFlix — HLS streams via xpass.top for movies & series.\n" +
     "Supports IMDB, TMDB & Cinemeta IDs. | By @Master_si",
   logo: "https://i.imgur.com/YPqM5vW.png",
@@ -71,42 +69,6 @@ export const manifest = {
         { name: "search", isRequired: false },
         { name: "skip", isRequired: false },
       ],
-    },
-    {
-      type: "movie",
-      id: "hdhub4u-latest",
-      name: "📡 HDHub4U — Latest",
-      extra: [{ name: "search", isRequired: false }, { name: "skip" }],
-    },
-    {
-      type: "movie",
-      id: "hdhub4u-bollywood",
-      name: "📡 Bollywood",
-      extra: [{ name: "skip" }],
-    },
-    {
-      type: "movie",
-      id: "hdhub4u-hollywood",
-      name: "📡 Hollywood",
-      extra: [{ name: "skip" }],
-    },
-    {
-      type: "movie",
-      id: "hdhub4u-hindi-dubbed",
-      name: "📡 Hindi Dubbed",
-      extra: [{ name: "skip" }],
-    },
-    {
-      type: "movie",
-      id: "hdhub4u-south",
-      name: "📡 South Hindi Dubbed",
-      extra: [{ name: "skip" }],
-    },
-    {
-      type: "series",
-      id: "hdhub4u-webseries",
-      name: "📡 HDHub4U — Web Series",
-      extra: [{ name: "search", isRequired: false }, { name: "skip" }],
     },
     {
       type: "movie",
@@ -165,11 +127,11 @@ export const manifest = {
   ],
   resources: [
     "catalog",
-    { name: "meta", types: ["movie", "series"], idPrefixes: ["hd4u:", "animedekho:", "rareanime:", "atoon:"] },
-    { name: "stream", types: ["movie", "series"], idPrefixes: ["tt", "hd4u:", "tmdb:", "animedekho:", "rareanime:", "atoon:"] },
+    { name: "meta", types: ["movie", "series"], idPrefixes: ["animedekho:", "rareanime:", "atoon:"] },
+    { name: "stream", types: ["movie", "series"], idPrefixes: ["tt", "tmdb:", "animedekho:", "rareanime:", "atoon:"] },
     { name: "subtitles", types: ["movie", "series"], idPrefixes: ["tt"] },
   ],
-  idPrefixes: ["tt", "hd4u:", "tmdb:", "animedekho:", "rareanime:", "atoon:"],
+  idPrefixes: ["tt", "tmdb:", "animedekho:", "rareanime:", "atoon:"],
   behaviorHints: {
     adult: false,
     p2p: false,
@@ -178,15 +140,6 @@ export const manifest = {
   },
 };
 
-export const CATALOG_MAP: Record<string, string> = {
-  "hdhub4u-latest": "",
-  "hdhub4u-bollywood": "category/bollywood-movies/",
-  "hdhub4u-hollywood": "category/hollywood-movies/",
-  "hdhub4u-hindi-dubbed": "category/hindi-dubbed/",
-  "hdhub4u-south": "category/south-hindi-movies/",
-  "hdhub4u-webseries": "category/web-series/",
-};
-
 // Provider config — order must match PROVIDER_LIST in lib/provider-config.ts
-// Index: 0=animesalt 1=rareanime 2=animedekho 3=netmirror 4=streamflix 5=dooflix 6=castletv 7=moviebox 8=dahmermovies 9=hindmovies 10=fourkdhub 11=hdhub4u
-export const ALL_ENABLED_MASK = "111111111111";
+// Index: 0=animesalt 1=rareanime 2=animedekho 3=netmirror 4=streamflix 5=dooflix 6=castletv 7=moviebox 8=dahmermovies 9=hindmovies
+export const ALL_ENABLED_MASK = "1111111111";
