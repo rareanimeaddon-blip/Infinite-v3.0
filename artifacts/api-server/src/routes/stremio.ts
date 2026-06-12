@@ -1624,7 +1624,11 @@ function premiumFormat(
 // Returns SRT files proxied through /subtitle-proxy so CORS + .gz decompression
 // are handled server-side.
 
-router.get("/subtitles/:type/:id.json", async (req, res) => {
+// Subtitle handler — shared by both route forms:
+//   2-segment: /subtitles/:type/:id.json          (Stremio Android / desktop)
+//   3-segment: /subtitles/:type/:id/*             (Stremio LG TV WebOS — appends stream URL as extra path)
+// In both cases `:id` is already the bare IMDB/Stremio ID without .json suffix.
+async function subtitlesHandler(req: import("express").Request, res: import("express").Response): Promise<void> {
   stremioHeaders(res);
   res.setHeader("Cache-Control", "max-age=21600"); // 6 h — subtitle lists are stable
 
@@ -1639,7 +1643,8 @@ router.get("/subtitles/:type/:id.json", async (req, res) => {
   const episode = parts[2] !== undefined ? parseInt(parts[2]!, 10) : null;
 
   if (!imdbId.startsWith("tt")) {
-    return void res.json({ subtitles: [] });
+    res.json({ subtitles: [] });
+    return;
   }
 
   try {
@@ -1676,13 +1681,21 @@ router.get("/subtitles/:type/:id.json", async (req, res) => {
     const uniqueYify = yifySubs.filter((s) => !seenUrls.has(s.url));
     const subtitles = [...providerSubs, ...uniqueYify];
 
-    logger.info({ imdbId, season, episode, provider: providerSubs.length, yify: yifySubs.length, total: subtitles.length }, "Stremio: subtitles (LG TV)");
+    logger.info({ imdbId, season, episode, provider: providerSubs.length, yify: yifySubs.length, total: subtitles.length }, "Stremio: subtitles");
     res.json({ subtitles });
   } catch (err) {
     logger.error({ err, id }, "Stremio: subtitle error");
     res.json({ subtitles: [] });
   }
-});
+}
+
+// 2-segment form: /subtitles/:type/:id.json  (Android / desktop / web)
+router.get("/subtitles/:type/:id.json", subtitlesHandler);
+// 3-segment form: /subtitles/:type/:id/:extra.json
+// LG TV WebOS appends the playing stream URL as a 3rd path segment ending in .json,
+// e.g. /subtitles/movie/tt16431404/filename=m3u8%3Furl%3D...master.m3u8....json
+// `:extra` captures and discards the stream-context info; `:id` is still the IMDB ID.
+router.get("/subtitles/:type/:id/:extra.json", subtitlesHandler);
 
 // ─── Stream endpoint ──────────────────────────────────────────────────────────
 
