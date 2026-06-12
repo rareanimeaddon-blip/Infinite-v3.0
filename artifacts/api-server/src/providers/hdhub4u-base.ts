@@ -236,7 +236,20 @@ async function resolveHubCloud(url: string): Promise<string | null> {
     if (!url.includes("hubcloud.php")) {
       const $init = await fetchHtml(url, headers);
       if (!$init) return null;
-      const raw = $init("#download").attr("href") ?? "";
+
+      const dlEl = $init("#download");
+      const xhref = dlEl.attr("x-href") ?? "";
+      const href  = dlEl.attr("href") ?? "";
+
+      let raw = href;
+      if (!raw && xhref) {
+        try {
+          raw = Buffer.from(xhref, "base64").toString("utf8");
+        } catch {
+          raw = "";
+        }
+      }
+
       if (raw) {
         downloadPageUrl = raw.startsWith("http")
           ? raw
