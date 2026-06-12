@@ -317,14 +317,18 @@ export async function extractStreams(
   if (!$) return [];
 
   const isSeries = season !== undefined && episode !== undefined;
-  const rawLinks: string[] = [];
+  const rawLinks: { url: string; context: string }[] = [];
+
+  // Extract page-level language once from body text (most reliable source)
+  const pageBodyText = $("main, .entry-content, .post-content, .page-body, article").first().text();
+  const pageLanguage = extractLanguage(pageBodyText + " " + pageUrl);
 
   if (!isSeries) {
     $("h3 a, h4 a").each((_i, el) => {
-      const text = $(el).text();
+      const text = $(el).text().trim();
       const href = $(el).attr("href") ?? "";
       if (/480|720|1080|2160|4K/i.test(text) && href.startsWith("http")) {
-        rawLinks.push(href);
+        rawLinks.push({ url: href, context: text });
       }
     });
 
@@ -334,7 +338,9 @@ export async function extractStreams(
         href.startsWith("http") &&
         /https?:\/\/(?:.*\.)?(hdstream4u|hubstream)\./i.test(href)
       ) {
-        if (!rawLinks.includes(href)) rawLinks.push(href);
+        if (!rawLinks.some((r) => r.url === href)) {
+          rawLinks.push({ url: href, context: $(el).text().trim() });
+        }
       }
     });
 
@@ -342,7 +348,9 @@ export async function extractStreams(
       $("a[href]").each((_i, el) => {
         const href = $(el).attr("href") ?? "";
         if (href.startsWith("http") && ALLOWED_STREAM_DOMAINS.test(href)) {
-          if (!rawLinks.includes(href)) rawLinks.push(href);
+          if (!rawLinks.some((r) => r.url === href)) {
+            rawLinks.push({ url: href, context: $(el).text().trim() });
+          }
         }
       });
     }
@@ -420,11 +428,11 @@ export async function extractStreams(
       $("a[href]").each((_i, el) => {
         const href = $(el).attr("href") ?? "";
         if (href.startsWith("http") && ALLOWED_STREAM_DOMAINS.test(href)) {
-          rawLinks.push(href);
+          rawLinks.push({ url: href, context: "" });
         }
       });
     } else {
-      rawLinks.push(...episodeLinks);
+      for (const l of episodeLinks) rawLinks.push({ url: l, context: "" });
     }
   }
 
@@ -433,18 +441,29 @@ export async function extractStreams(
     return [];
   }
 
-  const uniqueRaw = [...new Set(rawLinks)];
+  const seen = new Set<string>();
+  const uniqueRaw = rawLinks.filter((r) => {
+    if (seen.has(r.url)) return false;
+    seen.add(r.url);
+    return true;
+  });
+
   const streams: StreamEntry[] = [];
 
   const resolvePromises = uniqueRaw.slice(0, 12).map(async (link) => {
     try {
-      let finalLink = link;
-      if (link.includes("?id=")) {
-        finalLink = (await getRedirectLinks(link)) ?? link;
+      let finalLink = link.url;
+      if (link.url.includes("?id=")) {
+        finalLink = (await getRedirectLinks(link.url)) ?? link.url;
       }
 
-      const qualityHint = extractQuality(link + " " + pageUrl);
-      const languageHint = extractLanguage(link + " " + pageUrl);
+      // Context = anchor text (e.g. "1080p 10Bit HEVC [1.6GB]") + pageUrl slug
+      const ctx = link.context + " " + pageUrl;
+      const qualityHint = extractQuality(ctx);
+
+      // Size: extract from anchor text like "[370MB]", "[1.6GB]", "11.8GB"
+      const sizeMatch = /[\[(]?(\d+\.?\d*\s*(?:GB|MB))[\])]?/i.exec(link.context);
+      const size = sizeMatch ? sizeMatch[1]!.replace(/\s+/, " ") : undefined;
 
       const resolved = await resolveLink(finalLink, qualityHint);
       if (!resolved) return null;
@@ -452,14 +471,15 @@ export async function extractStreams(
       return {
         url: resolved.url,
         quality: resolved.quality,
-        language: languageHint,
+        language: pageLanguage,
         label: `${resolved.quality} [${resolved.host}]`,
         server: resolved.host,
+        size,
         season,
         episode,
       } as StreamEntry;
     } catch (err) {
-      logger.warn({ link, err }, "HDHub4U stream resolve failed");
+      logger.warn({ link: link.url, err }, "HDHub4U stream resolve failed");
       return null;
     }
   });
